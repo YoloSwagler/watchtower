@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1024, initial-scale=1">
+<title>Watchtower</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M12 3v4M8 5.5a7 7 0 1 0 8 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      <circle cx="12" cy="14" r="3.2" stroke="currentColor" stroke-width="1.8"/>
+      <path d="M12 17.2V21" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+    </svg>
+    <span class="brand-name">WATCHTOWER</span>
+    <span id="demo-badge" class="badge demo-badge" hidden>DEMO MODE</span>
+  </div>
+  <div class="status-pills">
+    <div class="pill" id="pill-sdr"><span class="dot"></span><span class="pill-label">SDR</span><span class="pill-value">—</span></div>
+    <div class="pill" id="pill-gps"><span class="dot"></span><span class="pill-label">GPS</span><span class="pill-value">—</span></div>
+    <div class="pill" id="pill-audio"><span class="dot"></span><span class="pill-label">AUDIO</span><span class="pill-value">idle</span></div>
+    <div class="pill clock" id="pill-clock"><span class="pill-value">--:--:--</span></div>
+  </div>
+</header>
+
+<main class="layout">
+
+  <section class="panel receiver-panel">
+    <div class="panel-header">Receiver</div>
+
+    <div id="banner-error" class="banner banner-error" hidden></div>
+    <div id="banner-hf" class="banner banner-warning" hidden>
+      Frequency below 24 MHz — a stock RTL-SDR tuner likely cannot receive this without direct sampling or an upconverter.
+    </div>
+
+    <div class="freq-display">
+      <span id="freq-readout">— . — — — —</span>
+      <span class="freq-unit">MHz</span>
+    </div>
+
+    <form id="tune-form" class="tune-row" autocomplete="off">
+      <label for="freq-input" class="sr-only">Frequency (MHz)</label>
+      <input id="freq-input" name="frequency" type="number" step="0.001" min="0" placeholder="Frequency in MHz" inputmode="decimal">
+      <button type="submit" class="btn btn-secondary">Tune</button>
+    </form>
+
+    <div class="control-row">
+      <span class="control-label">Mode</span>
+      <div class="mode-group" id="mode-group" role="group" aria-label="Demodulation mode">
+        <button type="button" class="mode-btn" data-mode="nfm">NFM</button>
+        <button type="button" class="mode-btn" data-mode="wfm">WFM</button>
+        <button type="button" class="mode-btn" data-mode="am">AM</button>
+        <button type="button" class="mode-btn" data-mode="usb">USB</button>
+        <button type="button" class="mode-btn" data-mode="lsb">LSB</button>
+      </div>
+    </div>
+
+    <div class="control-grid">
+      <label class="control-field">
+        <span class="control-label">Gain (dB, 0=auto)</span>
+        <input id="gain-input" type="number" step="1" value="0">
+      </label>
+      <label class="control-field">
+        <span class="control-label">Squelch</span>
+        <input id="squelch-input" type="number" step="1" value="0" min="0">
+      </label>
+      <label class="control-field">
+        <span class="control-label">PPM correction</span>
+        <input id="ppm-input" type="number" step="1" value="0">
+      </label>
+      <label class="control-field">
+        <span class="control-label">Device</span>
+        <select id="device-select"></select>
+      </label>
+    </div>
+
+    <div class="action-row">
+      <button id="btn-start" class="btn btn-start" type="button">Start Listening</button>
+      <button id="btn-stop" class="btn btn-stop" type="button" disabled>Stop Listening</button>
+    </div>
+
+    <audio id="audio-player" hidden></audio>
+  </section>
+
+  <aside class="side-column">
+
+    <section class="panel gps-panel">
+      <div class="panel-header">GPS</div>
+      <div class="gps-status-line">
+        <span class="dot" id="gps-dot"></span>
+        <span id="gps-status-text">Checking…</span>
+      </div>
+      <dl class="kv-list">
+        <div class="kv-row"><dt>Latitude</dt><dd id="gps-lat">—</dd></div>
+        <div class="kv-row"><dt>Longitude</dt><dd id="gps-lon">—</dd></div>
+        <div class="kv-row"><dt>Altitude</dt><dd id="gps-alt">—</dd></div>
+        <div class="kv-row"><dt>Satellites</dt><dd id="gps-sats">—</dd></div>
+        <div class="kv-row"><dt>Device</dt><dd id="gps-device">—</dd></div>
+        <div class="kv-row"><dt>Last update</dt><dd id="gps-time">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="panel health-panel">
+      <div class="panel-header">
+        System
+        <button id="btn-refresh-devices" class="btn btn-tiny" type="button">Refresh</button>
+      </div>
+      <ul class="tool-list" id="tool-list">
+        <li data-tool="rtl_test">rtl_test</li>
+        <li data-tool="rtl_fm">rtl_fm</li>
+        <li data-tool="ffmpeg">ffmpeg</li>
+        <li data-tool="gpsd">gpsd</li>
+      </ul>
+      <div class="device-list-label">Detected SDR devices</div>
+      <ul class="device-list" id="device-list">
+        <li class="muted">No devices detected yet.</li>
+      </ul>
+    </section>
+
+  </aside>
+
+</main>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
