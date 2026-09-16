@@ -6,13 +6,14 @@ import pathlib
 
 from aiohttp import web
 
-from watchtower.appkeys import CONFIG_KEY, DEMO_MODE_KEY, GPS_KEY, SDR_KEY
+from watchtower.appkeys import BOOKMARKS_KEY, CONFIG_KEY, DEMO_MODE_KEY, GPS_KEY, SDR_KEY
 from watchtower.config import AppConfig
 from watchtower.gps.demo import DemoGPSManager
 from watchtower.gps.manager import GPSManager
 from watchtower.logging_setup import configure_logging, get_logger
 from watchtower.sdr.demo import DemoSDRManager
 from watchtower.sdr.manager import SDRManager
+from watchtower.storage.bookmarks import BookmarkStore
 from watchtower.web import audio as audio_routes
 from watchtower.web import routes as api_routes
 
@@ -25,6 +26,7 @@ def create_app(config: AppConfig) -> web.Application:
     app = web.Application()
     app[CONFIG_KEY] = config
     app[DEMO_MODE_KEY] = config.demo
+    app[BOOKMARKS_KEY] = BookmarkStore(pathlib.Path(config.data_dir) / "bookmarks.json")
 
     if config.demo:
         app[SDR_KEY] = DemoSDRManager()
@@ -49,11 +51,13 @@ def create_app(config: AppConfig) -> web.Application:
 
 async def _on_startup(app: web.Application) -> None:
     await app[GPS_KEY].start()
+    await app[SDR_KEY].start_monitor()
     logger.info("watchtower started (demo=%s)", app[DEMO_MODE_KEY])
 
 
 async def _on_cleanup(app: web.Application) -> None:
     await app[GPS_KEY].stop()
+    await app[SDR_KEY].stop_monitor()
     await app[SDR_KEY].shutdown()
     logger.info("watchtower shut down cleanly")
 

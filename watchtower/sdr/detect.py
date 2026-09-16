@@ -33,6 +33,10 @@ def find_rtl_fm() -> str | None:
     return shutil.which("rtl_fm")
 
 
+def find_rtl_power() -> str | None:
+    return shutil.which("rtl_power")
+
+
 def find_ffmpeg() -> str | None:
     return shutil.which("ffmpeg")
 

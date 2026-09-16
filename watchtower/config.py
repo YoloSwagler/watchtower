@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+def _default_data_dir() -> str:
+    # Outside the installed package/source tree on purpose, so a future
+    # `git pull`/package upgrade that replaces application files never
+    # touches user data (bookmarks). See ARCHITECTURE.md, "Saved
+    # frequencies (bookmarks)".
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    base = xdg_data_home if xdg_data_home else os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "watchtower")
 
 
 @dataclass(frozen=True)
@@ -15,6 +25,7 @@ class AppConfig:
     verbose: bool = False
     gpsd_host: str = "127.0.0.1"
     gpsd_port: int = 2947
+    data_dir: str = field(default_factory=_default_data_dir)
 
 
 def load_config(argv: list[str] | None = None) -> AppConfig:
@@ -67,6 +78,11 @@ def load_config(argv: list[str] | None = None) -> AppConfig:
         default=int(os.environ.get("WATCHTOWER_GPSD_PORT", "2947")),
         help="gpsd port (default: 2947)",
     )
+    parser.add_argument(
+        "--data-dir",
+        default=os.environ.get("WATCHTOWER_DATA_DIR", _default_data_dir()),
+        help="Directory for user data such as saved frequencies (default: ~/.local/share/watchtower)",
+    )
     args = parser.parse_args(argv)
 
     host = "0.0.0.0" if args.lan else args.host  # noqa: S104 - explicit opt-in
@@ -78,4 +94,5 @@ def load_config(argv: list[str] | None = None) -> AppConfig:
         verbose=args.verbose,
         gpsd_host=args.gpsd_host,
         gpsd_port=args.gpsd_port,
+        data_dir=args.data_dir,
     )

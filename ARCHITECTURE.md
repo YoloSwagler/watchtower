@@ -328,3 +328,281 @@ No wideband scanning, no automatic signal detection/list, no spectrum or
 waterfall visualization, no offline mapping, no recording, no presets, no
 session logging, no multi-SDR-type support (RTL-SDR only). These are
 explicitly deferred, not accidentally missing.
+
+---
+
+# Phase 2 — Field-test hardening, wideband scanner, bookmarks
+
+Phase 2 was scoped after Phase 1 was field-tested on the actual target
+hardware (Pi 4B/2GB, RTL-SDR, u-blox 7 GPS, 1024x600 Chromium, offline).
+Everything below either fixes a real issue found on that hardware or adds
+the interactive scanner, which is Phase 2's primary deliverable. Nothing in
+this section changes Phase 1's process model, language choices, or "one
+dongle, one operator" scope — it extends the same `SDRManager` single-owner
+design to a second RF-owning mode (scanning) instead of introducing a new
+one.
+
+## Receiver state model
+
+Phase 1 already had a state machine (`ReceiverState`); Phase 2 extends it
+rather than replacing it:
+
+```
+IDLE  --start_scan-->  SCANNING  --stop_scan-->  IDLE
+IDLE  --start_listen-->  LISTENING  --stop_listen-->  IDLE
+SCANNING  --select signal-->  LISTENING   (stop scan, acquire SDR, tune, listen)
+LISTENING  --return to scan-->  SCANNING  (stop listening, resume remembered scan params)
+LISTENING  --stop, no scan to return to-->  IDLE
+(SCANNING | LISTENING | STARTING)  --hardware disappears-->  DISCONNECTED
+DISCONNECTED  --hardware reappears-->  IDLE
+```
+
+`STARTING` (a session is being stood up) and `ERROR` (a session failed to
+start) are Phase 1 substates that stay in Phase 2 unchanged — they are
+transient/terminal detail underneath the four conceptual states above, not
+a replacement for them. `SCANNING` and `DISCONNECTED` are the two new
+`ReceiverState` values.
+
+All transitions are still serialized through `SDRManager`'s single
+`asyncio.Lock`, so there is no separate "scanner" owner object and no
+claim/release registry — exactly one RF-owning pipeline (either the
+`rtl_fm | ffmpeg` listen pipeline or the `rtl_power` scan process) can exist
+at a time, enforced the same way Phase 1 enforced "only one listen session":
+starting either one tears down whatever the manager currently owns first.
+This is the direct answer to "how will rtl_power ownership integrate with
+the existing SDRManager": **it doesn't get its own owner — `SDRManager`
+tracks a `rtl_power` `ManagedProcess` exactly the way it already tracks
+`rtl_fm`/`ffmpeg`, gated by the same lock and the same state field.**
+
+### Hot-plug / disconnect detection (no new polling infrastructure)
+
+A single background task (`SDRManager._monitor_loop`, started from
+`app.py`'s `on_startup` via `start_monitor()`) ticks every
+`MONITOR_INTERVAL_SECONDS = 3.0`:
+
+- While `LISTENING`: cheaply checks `returncode` on the tracked `rtl_fm`/
+  `ffmpeg` `ManagedProcess` objects — no subprocess spawned, just an
+  attribute read. If either has exited without the manager having torn the
+  pipeline down itself, that's a real disconnect (or crash) — the manager
+  reaps whatever remains and transitions to `DISCONNECTED`.
+- While `SCANNING`: same check against the tracked `rtl_power` process.
+- While `IDLE` or `DISCONNECTED`: runs the existing `rtl_test`-based
+  `detect.detect_devices()` (already fast — device *enumeration* only, not
+  a claim) to notice a device arriving or leaving, and flips
+  `DISCONNECTED -> IDLE` or `IDLE -> DISCONNECTED` accordingly. A device
+  that was never seen at all does not read as "disconnected" — a
+  `_device_seen_once` flag distinguishes "never had one" from "had one,
+  lost it," matching how Phase 1's dev-machine-with-no-hardware case
+  already renders (`IDLE`, empty device list) rather than introducing a
+  false alarm.
+- While `STARTING`: skipped (transient).
+
+This means: no new subprocess is spawned at all while a pipeline is
+actively running (the check is a `None`/non-`None` read), and detection
+while idle costs exactly what a manual "Refresh devices" click already
+costs, once every 3 seconds. The browser's existing 2-second `/api/status`
+poll is what actually delivers the `DISCONNECTED`/`IDLE` transition to the
+UI — no WebSocket or second polling loop was added on the frontend either.
+Intentional stops (`stop_listening`, `stop_scan`) always clear the tracked
+`ManagedProcess` references as part of teardown *before* the next monitor
+tick can run (both go through the same lock), so a clean stop can never be
+mistaken for a disconnect.
+
+On `DISCONNECTED`, the SDR manager does not attempt to auto-resume a scan
+or a listen session when the device returns — it only clears back to
+`IDLE`. Auto-resuming would hide from the operator that a disconnect
+happened at all; the field-test report asked for the *status* to recover
+without a page refresh, not for silent resumption of RF reception.
+
+## Gain handling
+
+Two related Phase 1 issues, both found in the field-test report:
+
+1. **Gain 0 was always "manual 0 dB," never "automatic."** `ReceiverParams.
+   gain_db` was a plain `float` defaulting to `0.0`, and the `rtl_fm`
+   command builder always passed `-g 0.0`. `rtl_fm`/`rtl_power`'s actual
+   auto-gain convention is *omitting* `-g` entirely, not passing zero. Fix:
+   `gain_db` is now `float | None`, `None` means "omit `-g`, let the tuner
+   auto-gain." This is a pure semantic fix, not a new feature — the UI
+   control changes from a bare number input to a small preset list (`Auto`,
+   plus a handful of manual dB values) so the operator picks a real
+   supported gain rather than typing an arbitrary float. Probing the
+   attached tuner's exact supported gain steps in software would mean
+   adding a new dependency (`pyrtlsdr`/`SoapySDR` — `rtl_test`/`rtl_power`
+   don't expose a gain table on stdout), which isn't justified for this
+   phase; instead the preset list uses the well-known R820T/R820T2 gain
+   table (the tuner shown in Phase 1's own field test), documented in
+   `watchtower/sdr/gain.py` as a static, honestly-labeled approximation —
+   `rtl_fm`/`rtl_power` both snap any requested gain to the nearest gain
+   the tuner actually supports regardless, so an imperfect preset list
+   still produces correct behavior.
+2. **Gain couldn't be changed while listening.** `SDRManager.start_listening`
+   already began by tearing down whatever pipeline was running before
+   starting the new one — so "change gain live" doesn't need new pipeline
+   machinery, only a new entry point that reuses that exact behavior. The
+   lock-holding body of `start_listening` was split into a private
+   `_start_listening_locked()`; a new `set_gain()` method (also on
+   `SDRManagerBase`, so `DemoSDRManager` implements it too) takes the lock,
+   rebuilds `ReceiverParams` with everything unchanged except `gain_db`, and
+   calls `_start_listening_locked()` again — frequency, mode, squelch, and
+   ppm all survive because they come from the previous `ReceiverParams`,
+   not from the caller. This restarts the `rtl_fm | ffmpeg` pipeline (a few
+   hundred ms, same startup-health-check delay Phase 1 already pays on
+   every start) rather than sending `rtl_fm` a live control message —
+   `rtl_fm` has no such control channel, and introducing `rtl_tcp` or a
+   different tool purely to get live gain control was explicitly ruled out
+   as disproportionate for one control. The manager's externally-visible
+   `ReceiverState` never leaves `LISTENING`→`STARTING`→`LISTENING` in a way
+   that reads as "stopped" to the rest of the app; the `<audio>` element
+   does briefly reconnect (same as any retune), which is the "keep the
+   interruption as short as reasonably practical" tradeoff called for
+   instead of a bigger architecture change.
+
+## Wideband scanner
+
+### Process & data flow
+
+```
+rtl_power -f START:END:BIN -i 4 (-g GAIN) (-p PPM) -d DEV -   (CSV rows on stdout)
+        |
+        v
+SweepAccumulator   (watchtower/scanner/parser.py)
+  groups consecutive CSV rows sharing one (date, time) stamp — rtl_power
+  emits one row per hop, and a wide requested range needs several hops
+  (its own hop width is capped ~2.8 MHz) — into one complete Sweep once a
+  new timestamp starts.
+        |
+        v
+estimate_noise_floor + find_signals   (watchtower/scanner/detect.py)
+  pure functions over a Sweep: noise floor = median power across the
+  sweep (intentionally the simplest reasonable estimator — see "Signal
+  detection approach" below); bins >= noise_floor + threshold_db are
+  "active"; adjacent active bins are grouped into one DetectedSignal
+  (peak frequency, peak power, approx bandwidth, SNR).
+        |
+        v
+SignalTracker   (watchtower/scanner/tracker.py)
+  matches each sweep's DetectedSignals against previously tracked ones by
+  frequency proximity, updates power/SNR/last_seen, expires entries not
+  re-observed within TTL_SECONDS. This is what turns "one sweep's peaks"
+  into a stable, decaying signal list rather than a list that flickers
+  and regrows every sweep cycle.
+        |
+        v
+SDRManager._scan_signals (cached, read by /api/status)
+```
+
+`rtl_power` is spawned and torn down exactly like `rtl_fm`/`ffmpeg`
+(`process.spawn`, `ManagedProcess`, `os.killpg` on stop) — no new
+subprocess-lifecycle code was needed, only a new command builder and a
+stdout-line reader task feeding the pipeline above. Validation of the
+requested range/bin size (`watchtower/scanner/base.py:validate_scan_range`)
+happens both in the API route (a fast 400 before anything is spawned) and again in
+`SDRManager.start_scan` (defense in depth, and the only check that matters
+for direct callers/tests) — span capped at `MAX_SCAN_SPAN_MHZ = 1000` and
+bin size clamped to `1–1000 kHz`, which bounds worst-case scan-cycle time
+and CPU on the Pi 4B.
+
+### Signal detection approach (intentionally simple)
+
+- **Noise floor**: median power across the whole sweep. A global median is
+  crude compared to a per-band rolling floor, but it is one line of code,
+  easy to reason about, and good enough for "help the operator see what's
+  active" — not a calibrated measurement. This is written down explicitly
+  so a future phase doesn't mistake it for more than it is.
+- **Peak detection**: bins at or above `noise_floor + SIGNAL_THRESHOLD_DB`
+  (default 10 dB) are active; runs of adjacent active bins become one
+  signal. No modulation recognition, no classification, no fingerprinting
+  — the output is "here's a frequency that's active," which is exactly the
+  scope asked for.
+- **Center frequency**: the frequency of the single highest-power bin in
+  the group (not a power-weighted centroid) — simpler, and close enough
+  given the bin sizes in use (kHz-scale, not Hz-scale precision).
+- **Tracking/expiry**: `SignalTracker` is a plain in-memory dict keyed by a
+  rounded frequency bucket, capped by TTL-based expiry — this is the one
+  place a naive implementation could grow unbounded ("no unbounded
+  in-memory sweep histories" was explicit in scope), so entries older than
+  `SIGNAL_TTL_SECONDS` (default 30s) are dropped every update, and only the
+  current tracked-signal list is kept — raw sweep bin data is never
+  retained past producing that sweep's `DetectedSignal`s.
+
+### Scan <-> listen <-> scan transitions
+
+- Selecting a signal (`POST /api/sdr/scan/listen`) calls, under the
+  manager's lock: stop the scan (`_stop_scan_locked`, remembering
+  `ScanParams` in `_last_scan_params`), then `_start_listening_locked` with
+  the selected frequency and a demod mode (operator-selected or a sensible
+  default). This is the same "tear down whatever's running, then start the
+  new thing" pattern Phase 1 already used for listen→listen restarts.
+- `POST /api/sdr/scan/resume` starts scanning again using
+  `_last_scan_params` if one is remembered (typically right after stopping
+  a listen session that came from a scan); it's a plain, visible action in
+  the UI ("Return to Scan" button), not something that fires automatically
+  the instant listening stops — the operator explicitly asked to keep this
+  "understandable," and an automatic resume could restart RF scanning
+  while the operator is still doing something else with the frequency they
+  just tuned to (e.g. about to save it).
+
+### Demo scanning
+
+`watchtower/scanner/demo_source.py` is the *only* place that fabricates
+sweep data — it generates a Sweep with a wandering synthetic noise floor
+and a handful of seeded, slowly-drifting "signals" at fixed demo
+frequencies. That synthetic Sweep is fed through the exact same
+`estimate_noise_floor`/`find_signals`/`SignalTracker` pipeline production
+scanning uses, so demo mode exercises real detection/tracking logic end to
+end, not a separately-faked signal list — only the RF input is fake.
+`DemoSDRManager.start_scan`/`stop_scan` never spawn `rtl_power`.
+
+## Saved frequencies (bookmarks)
+
+`watchtower/storage/bookmarks.py`: a `BookmarkStore` backed by a single
+JSON file (`{data_dir}/bookmarks.json`, default
+`~/.local/share/watchtower/`, overridable with `--data-dir` /
+`WATCHTOWER_DATA_DIR`) — no SQLite, matching the explicit "don't add a
+database for this" instruction. `data_dir` defaults outside the installed
+package/`watchtower/` source tree specifically so a future `git pull`/
+package upgrade that replaces application files can never touch it.
+Writes are atomic (write to a temp file in the same directory, then
+`os.replace`) since this runs on a Pi's SD card in the field, where a
+mid-write power loss is a real (if rare) risk worth one extra syscall to
+avoid. Reads/writes are serialized by a single `asyncio.Lock` in the store
+— there is exactly one browser tab/operator, so this is not solving a
+concurrency problem, just preventing two near-simultaneous requests from
+interleaving a read-modify-write.
+
+A bookmark is `{id, name, frequency_mhz, mode, gain_db (nullable = auto),
+squelch, note, created_at, updated_at}`. Selecting one in the UI both
+populates the receiver controls *and* immediately starts listening
+(one action, matching the field-test complaint about repeated manual
+retyping) rather than only pre-filling the form. `POST /api/bookmarks`
+with the currently-tuned/listening parameters is how "Scan → select → 
+listen → Save Frequency → name it" is wired up — it's a plain create call
+against whatever `ReceiverParams` the SDR manager currently reports, no
+special-cased "save from scan" code path.
+
+## Directory structure additions
+
+```
+watchtower/
+├── scanner/
+│   ├── __init__.py
+│   ├── base.py        # ScanParams, DetectedSignal, TrackedSignal, Sweep, validate_scan_range
+│   ├── parser.py       # parse_rtl_power_line, SweepAccumulator
+│   ├── detect.py       # estimate_noise_floor, find_signals
+│   ├── tracker.py      # SignalTracker
+│   └── demo_source.py  # synthetic sweep generator (demo mode only)
+├── sdr/
+│   └── gain.py          # static R820T/R820T2 gain preset table
+├── storage/
+│   ├── __init__.py
+│   └── bookmarks.py     # Bookmark dataclass + JSON-file BookmarkStore
+```
+
+## Known Phase 2 limitations (by design, see ROADMAP.md)
+
+No spectrum/waterfall rendering (sweep data is structured so Phase 3 can
+consume it, but no chart/canvas work happens in this phase), no modulation
+recognition/classification/decoding, no per-tuner dynamic gain probing, no
+automatic resumption of scanning/listening across a hardware disconnect,
+no expansion of GPS functionality beyond what Phase 1 already had.

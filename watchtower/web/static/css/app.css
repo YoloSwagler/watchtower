@@ -16,6 +16,12 @@
 
 * { box-sizing: border-box; }
 
+/* Author rules below set `display: flex/grid` on several elements that are
+   also toggled via the `hidden` attribute (mode-view, bookmark-save-row,
+   banners); without this, that display value wins over the UA default of
+   `[hidden] { display: none }` and the element stays visible. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -145,6 +151,39 @@ html, body {
   justify-content: space-between;
 }
 
+/* ---------- Tabs / mode views ---------- */
+
+.tab-group {
+  display: flex;
+  gap: 4px;
+}
+
+.tab-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 5px 14px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.tab-btn.active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.mode-view {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
 .side-column {
   display: flex;
   flex-direction: column;
@@ -152,8 +191,9 @@ html, body {
   min-height: 0;
 }
 
-.gps-panel { flex: 1.1; }
-.health-panel { flex: 1; overflow: auto; }
+.gps-panel { flex: 1; }
+.bookmarks-panel { flex: 1.15; overflow: auto; }
+.health-panel { flex: 0.85; overflow: auto; }
 
 /* ---------- Banners ---------- */
 
@@ -366,7 +406,7 @@ input:focus, select:focus, button:focus {
   margin: 0 0 12px;
   padding: 0;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 6px;
 }
 
@@ -420,3 +460,178 @@ input:focus, select:focus, button:focus {
 }
 
 .muted { color: var(--muted); font-family: inherit; }
+
+/* ---------- Scan view ---------- */
+
+.scan-range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.scan-range-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.scan-range-sep {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.scan-range-row select {
+  flex: none;
+  width: 110px;
+}
+
+.scan-meta-row {
+  display: flex;
+  gap: 16px;
+  font-size: 12px;
+  margin: 10px 0 8px;
+}
+
+.signal-table-wrap {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  min-height: 0;
+}
+
+.signal-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.signal-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-bg-raised);
+  color: var(--muted);
+  text-align: left;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.signal-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.signal-table tbody tr:last-child td { border-bottom: none; }
+
+.signal-row {
+  cursor: pointer;
+}
+
+.signal-row:hover { background: var(--panel-bg-raised); }
+
+.signal-row.signal-strong td:first-child { color: var(--accent); font-weight: 700; }
+.signal-row.signal-stale { opacity: 0.5; }
+
+/* ---------- Saved frequencies panel ---------- */
+
+.bookmark-save-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.bookmark-save-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.bookmark-edit-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-bg);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  border-radius: 5px;
+  padding: 5px 7px;
+  font-size: 12.5px;
+}
+
+.bookmark-item.editing { cursor: default; }
+
+.bookmark-action-btn.confirm-delete {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.bookmark-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  overflow-y: auto;
+}
+
+.bookmark-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 8px;
+  cursor: pointer;
+}
+
+.bookmark-item:hover { border-color: var(--accent); }
+
+.bookmark-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.bookmark-name {
+  font-weight: 700;
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bookmark-detail {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.bookmark-actions {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+
+.bookmark-action-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 5px;
+  width: 22px;
+  height: 22px;
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.bookmark-action-btn:hover { color: var(--text); border-color: var(--text); }
+
+/* ---------- Disconnected state ---------- */
+
+.pill.state-disconnected .dot { background: var(--danger); box-shadow: 0 0 6px var(--danger); }

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 class ToolStatus:
     rtl_test: bool
     rtl_fm: bool
+    rtl_power: bool
     ffmpeg: bool
     gpsd: bool
 
@@ -21,6 +22,7 @@ class ToolStatus:
         return {
             "rtl_test": self.rtl_test,
             "rtl_fm": self.rtl_fm,
+            "rtl_power": self.rtl_power,
             "ffmpeg": self.ffmpeg,
             "gpsd": self.gpsd,
         }
@@ -30,6 +32,7 @@ def check_tools() -> ToolStatus:
     return ToolStatus(
         rtl_test=shutil.which("rtl_test") is not None,
         rtl_fm=shutil.which("rtl_fm") is not None,
+        rtl_power=shutil.which("rtl_power") is not None,
         ffmpeg=shutil.which("ffmpeg") is not None,
         gpsd=shutil.which("gpsd") is not None,
     )

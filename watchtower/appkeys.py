@@ -12,8 +12,10 @@ from aiohttp import web
 from watchtower.config import AppConfig
 from watchtower.gps.base import GPSManagerBase
 from watchtower.sdr.base import SDRManagerBase
+from watchtower.storage.bookmarks import BookmarkStore
 
 CONFIG_KEY: web.AppKey[AppConfig] = web.AppKey("config", AppConfig)
 DEMO_MODE_KEY: web.AppKey[bool] = web.AppKey("demo_mode", bool)
 SDR_KEY: web.AppKey[SDRManagerBase] = web.AppKey("sdr", SDRManagerBase)
 GPS_KEY: web.AppKey[GPSManagerBase] = web.AppKey("gps", GPSManagerBase)
+BOOKMARKS_KEY: web.AppKey[BookmarkStore] = web.AppKey("bookmarks", BookmarkStore)

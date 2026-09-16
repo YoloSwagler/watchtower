@@ -4,17 +4,30 @@ Pipeline for a listen session:
 
     rtl_fm (raw s16le PCM on stdout) -> ffmpeg (WAV framing on stdout)
 
-Only one pipeline exists at a time. Starting a new one always tears down
-whatever is currently running first (see ARCHITECTURE.md, "SDR resource
-management").
+Pipeline for a scan session:
+
+    rtl_power (CSV sweep rows on stdout) -> SweepAccumulator -> Sweep
+        -> estimate_noise_floor/find_signals -> SignalTracker
+
+Only one pipeline (listen or scan) exists at a time — both are owned and
+torn down through the same asyncio.Lock and the same ReceiverState field.
+Starting either one always tears down whatever the manager currently owns
+first. See ARCHITECTURE.md, "Receiver state model" and "Wideband scanner".
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
+from dataclasses import replace
 
 from watchtower.logging_setup import get_logger
+from watchtower.scanner import detect as scanner_detect
+from watchtower.scanner import parser as scanner_parser
+from watchtower.scanner.base import ScanParams, validate_scan_range
+from watchtower.scanner.parser import SweepAccumulator
+from watchtower.scanner.tracker import SignalTracker
 from watchtower.sdr import detect, process
 from watchtower.sdr.base import (
     HF_ADVISORY_THRESHOLD_MHZ,
@@ -24,6 +37,8 @@ from watchtower.sdr.base import (
     SDRDevice,
     SDRManagerBase,
     SDRSnapshot,
+    ScanSnapshot,
+    TrackedSignalView,
 )
 from watchtower.sdr.process import ManagedProcess
 
@@ -39,6 +54,15 @@ _RTL_FM_MODE = {
 
 STARTUP_HEALTH_CHECK_DELAY = 0.3
 
+# How often the background hot-plug monitor ticks. Modest on purpose: while
+# a pipeline is active this only ever checks a cached returncode (no
+# subprocess spawned); it only spawns rtl_test (fast, enumeration-only)
+# while idle/disconnected. See ARCHITECTURE.md, "Hot-plug / disconnect
+# detection".
+MONITOR_INTERVAL_SECONDS = 3.0
+
+SCAN_INTERVAL_SECONDS = 4
+
 
 def _rates_for_mode(mode: DemodMode) -> tuple[int, int]:
     """(capture_rate, output_rate) in Hz for each demod mode."""
@@ -52,17 +76,21 @@ def _rates_for_mode(mode: DemodMode) -> tuple[int, int]:
 def _build_rtl_fm_cmd(rtl_fm_path: str, params: ReceiverParams) -> list[str]:
     capture_rate, output_rate = _rates_for_mode(params.mode)
     freq_hz = int(round(params.frequency_mhz * 1_000_000))
-    return [
+    cmd = [
         rtl_fm_path,
         "-M", _RTL_FM_MODE[params.mode],
         "-f", str(freq_hz),
         "-s", str(capture_rate),
         "-r", str(output_rate),
-        "-g", str(params.gain_db),
+    ]  # fmt: skip
+    if params.gain_db is not None:
+        cmd += ["-g", str(params.gain_db)]
+    cmd += [
         "-p", str(params.ppm),
         "-l", str(params.squelch),
         "-d", str(params.device_index),
     ]  # fmt: skip
+    return cmd
 
 
 def _build_ffmpeg_cmd(ffmpeg_path: str, output_rate: int) -> list[str]:
@@ -74,6 +102,24 @@ def _build_ffmpeg_cmd(ffmpeg_path: str, output_rate: int) -> list[str]:
         "-f", "s16le", "-ar", str(output_rate), "-ac", "1", "-i", "pipe:0",
         "-acodec", "pcm_s16le", "-ar", "44100", "-f", "wav", "pipe:1",
     ]  # fmt: skip
+
+
+def _build_rtl_power_cmd(rtl_power_path: str, params: ScanParams) -> list[str]:
+    start_hz = int(round(params.start_mhz * 1_000_000))
+    end_hz = int(round(params.end_mhz * 1_000_000))
+    bin_hz = int(round(params.bin_khz * 1000))
+    cmd = [
+        rtl_power_path,
+        "-f", f"{start_hz}:{end_hz}:{bin_hz}",
+        "-i", str(SCAN_INTERVAL_SECONDS),
+        "-d", str(params.device_index),
+    ]  # fmt: skip
+    if params.gain_db is not None:
+        cmd += ["-g", str(params.gain_db)]
+    if params.ppm:
+        cmd += ["-p", str(params.ppm)]
+    cmd.append("-")  # dump CSV rows to stdout instead of a file
+    return cmd
 
 
 async def _pump_pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -126,19 +172,58 @@ class SDRManager(SDRManagerBase):
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._state = ReceiverState.IDLE
-        self._params: ReceiverParams | None = None
         self._error: str | None = None
+        self._cached_devices: list[SDRDevice] = []
+        self._devices_stale = False
+        self._device_seen_once = False
+
+        # Listen pipeline
+        self._params: ReceiverParams | None = None
         self._rtl_proc: ManagedProcess | None = None
         self._ffmpeg_proc: ManagedProcess | None = None
         self._pump_task: asyncio.Task | None = None
-        self._cached_devices: list[SDRDevice] = []
-        self._devices_stale = False
         self._audio_client_lock = asyncio.Lock()
         self._audio_client_active = False
+
+        # Scan pipeline
+        self._scan_proc: ManagedProcess | None = None
+        self._scan_reader_task: asyncio.Task | None = None
+        self._scan_params: ScanParams | None = None
+        self._last_scan_params: ScanParams | None = None
+        self._scan_accumulator: SweepAccumulator | None = None
+        self._scan_tracker: SignalTracker | None = None
+        self._scan_noise_floor_db: float | None = None
+        self._scan_last_sweep_at: float | None = None
+        self._scan_signals: list = []
+
+        # Hot-plug monitor
+        self._monitor_task: asyncio.Task | None = None
+
+    # ---------------------------------------------------------------- status
 
     async def snapshot(self) -> SDRSnapshot:
         tools_available = detect.find_rtl_fm() is not None and detect.find_ffmpeg() is not None
         hf_advisory = bool(self._params and self._params.frequency_mhz < HF_ADVISORY_THRESHOLD_MHZ)
+        scan_snapshot = None
+        if self._scan_params is not None:
+            scan_snapshot = ScanSnapshot(
+                start_mhz=self._scan_params.start_mhz,
+                end_mhz=self._scan_params.end_mhz,
+                bin_khz=self._scan_params.bin_khz,
+                noise_floor_db=self._scan_noise_floor_db,
+                last_sweep_at=self._scan_last_sweep_at,
+                signals=[
+                    TrackedSignalView(
+                        frequency_mhz=s.frequency_hz / 1_000_000,
+                        power_db=s.power_db,
+                        snr_db=s.snr_db,
+                        bandwidth_khz=s.bandwidth_hz / 1000,
+                        first_seen=s.first_seen,
+                        last_seen=s.last_seen,
+                    )
+                    for s in self._scan_signals
+                ],
+            )
         return SDRSnapshot(
             state=self._state,
             tools_available=tools_available,
@@ -147,83 +232,101 @@ class SDRManager(SDRManagerBase):
             params=self._params,
             error=self._error,
             hf_advisory=hf_advisory,
+            scan=scan_snapshot,
+            can_resume_scan=self._last_scan_params is not None,
         )
 
     async def refresh_devices(self) -> list[SDRDevice]:
         async with self._lock:
-            if self._state != ReceiverState.IDLE:
+            if self._state not in (ReceiverState.IDLE, ReceiverState.DISCONNECTED):
                 self._devices_stale = True
                 return list(self._cached_devices)
         devices = await detect.detect_devices()
         async with self._lock:
             self._cached_devices = devices
             self._devices_stale = False
+            if devices:
+                self._device_seen_once = True
         return devices
+
+    # --------------------------------------------------------------- listen
 
     async def start_listening(self, params: ReceiverParams) -> tuple[bool, str | None]:
         async with self._lock:
-            await self._stop_internal()
+            return await self._start_listening_locked(params)
 
-            rtl_fm_path = detect.find_rtl_fm()
-            ffmpeg_path = detect.find_ffmpeg()
-            if not rtl_fm_path:
-                self._state, self._error = ReceiverState.ERROR, "rtl_fm not found. Install the rtl-sdr package."
-                return False, self._error
-            if not ffmpeg_path:
-                self._state, self._error = ReceiverState.ERROR, "ffmpeg not found. Install ffmpeg."
-                return False, self._error
+    async def _start_listening_locked(self, params: ReceiverParams) -> tuple[bool, str | None]:
+        await self._stop_scan_internal()
+        await self._stop_internal()
 
-            self._state = ReceiverState.STARTING
-            self._error = None
-            _, output_rate = _rates_for_mode(params.mode)
+        rtl_fm_path = detect.find_rtl_fm()
+        ffmpeg_path = detect.find_ffmpeg()
+        if not rtl_fm_path:
+            self._state, self._error = ReceiverState.ERROR, "rtl_fm not found. Install the rtl-sdr package."
+            return False, self._error
+        if not ffmpeg_path:
+            self._state, self._error = ReceiverState.ERROR, "ffmpeg not found. Install ffmpeg."
+            return False, self._error
 
-            try:
-                rtl_proc = await process.spawn(
-                    *_build_rtl_fm_cmd(rtl_fm_path, params),
-                    label="rtl_fm",
-                    stdin=asyncio.subprocess.DEVNULL,
-                )
-            except OSError as e:
-                self._state, self._error = ReceiverState.ERROR, f"Failed to start rtl_fm: {e}"
-                return False, self._error
+        self._state = ReceiverState.STARTING
+        self._error = None
+        _, output_rate = _rates_for_mode(params.mode)
 
-            try:
-                ffmpeg_proc = await process.spawn(
-                    *_build_ffmpeg_cmd(ffmpeg_path, output_rate),
-                    label="ffmpeg",
-                    stdin=asyncio.subprocess.PIPE,
-                )
-            except OSError as e:
-                await rtl_proc.terminate()
-                self._state, self._error = ReceiverState.ERROR, f"Failed to start ffmpeg: {e}"
-                return False, self._error
-
-            pump_task = asyncio.create_task(
-                _pump_pipe(rtl_proc.proc.stdout, ffmpeg_proc.proc.stdin), name="sdr-audio-pump"
+        try:
+            rtl_proc = await process.spawn(
+                *_build_rtl_fm_cmd(rtl_fm_path, params),
+                label="rtl_fm",
+                stdin=asyncio.subprocess.DEVNULL,
             )
+        except OSError as e:
+            self._state, self._error = ReceiverState.ERROR, f"Failed to start rtl_fm: {e}"
+            return False, self._error
 
-            await asyncio.sleep(STARTUP_HEALTH_CHECK_DELAY)
-            if rtl_proc.proc.returncode is not None or ffmpeg_proc.proc.returncode is not None:
-                stderr_text = (await _read_stderr_text(rtl_proc)) or (await _read_stderr_text(ffmpeg_proc))
-                pump_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await pump_task
-                await ffmpeg_proc.terminate()
-                await rtl_proc.terminate()
-                self._state = ReceiverState.ERROR
-                self._error = _friendly_error(stderr_text)
-                logger.warning("listen pipeline failed to start: %s", self._error)
-                return False, self._error
-
-            self._rtl_proc = rtl_proc
-            self._ffmpeg_proc = ffmpeg_proc
-            self._pump_task = pump_task
-            self._params = params
-            self._state = ReceiverState.LISTENING
-            logger.info(
-                "listening: %.4f MHz mode=%s device=%s", params.frequency_mhz, params.mode.value, params.device_index
+        try:
+            ffmpeg_proc = await process.spawn(
+                *_build_ffmpeg_cmd(ffmpeg_path, output_rate),
+                label="ffmpeg",
+                stdin=asyncio.subprocess.PIPE,
             )
-            return True, None
+        except OSError as e:
+            await rtl_proc.terminate()
+            self._state, self._error = ReceiverState.ERROR, f"Failed to start ffmpeg: {e}"
+            return False, self._error
+
+        pump_task = asyncio.create_task(
+            _pump_pipe(rtl_proc.proc.stdout, ffmpeg_proc.proc.stdin), name="sdr-audio-pump"
+        )
+
+        await asyncio.sleep(STARTUP_HEALTH_CHECK_DELAY)
+        if rtl_proc.proc.returncode is not None or ffmpeg_proc.proc.returncode is not None:
+            stderr_text = (await _read_stderr_text(rtl_proc)) or (await _read_stderr_text(ffmpeg_proc))
+            pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pump_task
+            await ffmpeg_proc.terminate()
+            await rtl_proc.terminate()
+            self._state = ReceiverState.ERROR
+            self._error = _friendly_error(stderr_text)
+            logger.warning("listen pipeline failed to start: %s", self._error)
+            return False, self._error
+
+        self._rtl_proc = rtl_proc
+        self._ffmpeg_proc = ffmpeg_proc
+        self._pump_task = pump_task
+        self._params = params
+        self._state = ReceiverState.LISTENING
+        self._device_seen_once = True
+        logger.info(
+            "listening: %.4f MHz mode=%s device=%s", params.frequency_mhz, params.mode.value, params.device_index
+        )
+        return True, None
+
+    async def set_gain(self, gain_db: float | None) -> tuple[bool, str | None]:
+        async with self._lock:
+            if self._state != ReceiverState.LISTENING or self._params is None:
+                return False, "Not currently listening."
+            new_params = replace(self._params, gain_db=gain_db)
+            return await self._start_listening_locked(new_params)
 
     async def stop_listening(self) -> None:
         async with self._lock:
@@ -285,6 +388,208 @@ class SDRManager(SDRManagerBase):
         finally:
             self._audio_client_active = False
 
+    # ----------------------------------------------------------------- scan
+
+    async def start_scan(self, params: ScanParams) -> tuple[bool, str | None]:
+        async with self._lock:
+            return await self._start_scan_locked(params)
+
+    async def _start_scan_locked(self, params: ScanParams) -> tuple[bool, str | None]:
+        await self._stop_internal()
+        await self._stop_scan_internal()
+
+        error = validate_scan_range(params.start_mhz, params.end_mhz, params.bin_khz)
+        if error:
+            self._state, self._error = ReceiverState.ERROR, error
+            return False, error
+
+        rtl_power_path = detect.find_rtl_power()
+        if not rtl_power_path:
+            self._state, self._error = ReceiverState.ERROR, "rtl_power not found. Install the rtl-sdr package."
+            return False, self._error
+
+        self._state = ReceiverState.STARTING
+        self._error = None
+
+        try:
+            scan_proc = await process.spawn(
+                *_build_rtl_power_cmd(rtl_power_path, params),
+                label="rtl_power",
+                stdin=asyncio.subprocess.DEVNULL,
+            )
+        except OSError as e:
+            self._state, self._error = ReceiverState.ERROR, f"Failed to start rtl_power: {e}"
+            return False, self._error
+
+        await asyncio.sleep(STARTUP_HEALTH_CHECK_DELAY)
+        if scan_proc.proc.returncode is not None:
+            stderr_text = await _read_stderr_text(scan_proc)
+            await scan_proc.terminate()
+            self._state = ReceiverState.ERROR
+            self._error = _friendly_error(stderr_text)
+            logger.warning("scan failed to start: %s", self._error)
+            return False, self._error
+
+        match_tolerance_hz = max(params.bin_khz * 1000 * 2, 5000)
+        self._scan_proc = scan_proc
+        self._scan_params = params
+        self._scan_accumulator = SweepAccumulator()
+        self._scan_tracker = SignalTracker(match_tolerance_hz=match_tolerance_hz)
+        self._scan_noise_floor_db = None
+        self._scan_last_sweep_at = None
+        self._scan_signals = []
+        self._scan_reader_task = asyncio.create_task(self._read_scan_output(scan_proc), name="sdr-scan-reader")
+        self._state = ReceiverState.SCANNING
+        self._device_seen_once = True
+        logger.info(
+            "scanning: %.4f-%.4f MHz bin=%.1fkHz device=%s",
+            params.start_mhz, params.end_mhz, params.bin_khz, params.device_index,
+        )  # fmt: skip
+        return True, None
+
+    async def stop_scan(self) -> None:
+        async with self._lock:
+            await self._stop_scan_internal()
+
+    async def resume_scan(self) -> tuple[bool, str | None]:
+        async with self._lock:
+            if self._last_scan_params is None:
+                return False, "No previous scan to resume."
+            return await self._start_scan_locked(self._last_scan_params)
+
+    async def _stop_scan_internal(self) -> None:
+        if self._scan_reader_task:
+            self._scan_reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._scan_reader_task
+            self._scan_reader_task = None
+        if self._scan_proc:
+            await self._scan_proc.terminate()
+            self._scan_proc = None
+        if self._scan_params is not None:
+            self._last_scan_params = self._scan_params
+        self._scan_params = None
+        self._scan_accumulator = None
+        self._scan_tracker = None
+        self._scan_noise_floor_db = None
+        self._scan_last_sweep_at = None
+        self._scan_signals = []
+        if self._state in (ReceiverState.SCANNING, ReceiverState.STARTING):
+            self._state = ReceiverState.IDLE
+
+    async def _read_scan_output(self, proc: ManagedProcess) -> None:
+        stream = proc.proc.stdout
+        if stream is None:
+            return
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                self._ingest_scan_line(line.decode(errors="replace"))
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+
+    def _ingest_scan_line(self, text: str) -> None:
+        # Runs outside self._lock (it's the scan reader task, not a public
+        # entry point) — deliberately: these are cosmetic telemetry fields
+        # read by snapshot(), not correctness-critical state, and
+        # _stop_scan_internal() always cancels+awaits this task before
+        # clearing them, so there's no write-after-clear race.
+        text = text.strip()
+        if not text or self._scan_accumulator is None or self._scan_tracker is None:
+            return
+        try:
+            row = scanner_parser.parse_rtl_power_line(text)
+        except ValueError:
+            logger.debug("ignoring unparseable rtl_power line: %r", text[:200])
+            return
+        sweep = self._scan_accumulator.ingest(row)
+        if sweep is None:
+            return
+        noise_floor = scanner_detect.estimate_noise_floor(sweep.powers_db)
+        detected = scanner_detect.find_signals(sweep, noise_floor)
+        now = time.time()
+        self._scan_signals = self._scan_tracker.update(detected, now=now)
+        self._scan_noise_floor_db = noise_floor
+        self._scan_last_sweep_at = now
+
+    # --------------------------------------------------------- hot-plug monitor
+
+    async def start_monitor(self) -> None:
+        if self._monitor_task is None:
+            self._monitor_task = asyncio.create_task(self._monitor_loop(), name="sdr-hotplug-monitor")
+
+    async def stop_monitor(self) -> None:
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._monitor_task
+            self._monitor_task = None
+
+    async def _monitor_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
+                await self._monitor_tick()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("hotplug monitor tick failed")
+
+    async def _monitor_tick(self) -> None:
+        async with self._lock:
+            state = self._state
+            if state == ReceiverState.LISTENING:
+                dead = (self._rtl_proc is not None and self._rtl_proc.proc.returncode is not None) or (
+                    self._ffmpeg_proc is not None and self._ffmpeg_proc.proc.returncode is not None
+                )
+                if dead:
+                    await self._handle_unexpected_exit_locked()
+                return
+            if state == ReceiverState.SCANNING:
+                if self._scan_proc is not None and self._scan_proc.proc.returncode is not None:
+                    await self._handle_unexpected_exit_locked()
+                return
+            if state not in (ReceiverState.IDLE, ReceiverState.DISCONNECTED):
+                return  # STARTING/ERROR: nothing useful to check this tick
+
+        # Only reached for IDLE/DISCONNECTED. detect_devices() spawns
+        # rtl_test, so it runs without holding the lock — a concurrent
+        # start_listening/start_scan shouldn't have to wait on a hardware
+        # probe.
+        devices = await detect.detect_devices()
+        async with self._lock:
+            if self._state not in (ReceiverState.IDLE, ReceiverState.DISCONNECTED):
+                return  # became busy while we were probing; ignore this tick
+            self._cached_devices = devices
+            self._devices_stale = False
+            present = len(devices) > 0
+            if present:
+                self._device_seen_once = True
+            if self._state == ReceiverState.DISCONNECTED and present:
+                self._state = ReceiverState.IDLE
+                self._error = None
+                logger.info("SDR reconnected")
+            elif self._state == ReceiverState.IDLE and not present and self._device_seen_once:
+                self._state = ReceiverState.DISCONNECTED
+                self._error = "SDR disconnected"
+                logger.warning("SDR disconnected (was idle)")
+
+    async def _handle_unexpected_exit_locked(self) -> None:
+        """Caller must already hold self._lock (see _monitor_tick)."""
+        logger.warning("receive pipeline exited unexpectedly; treating as SDR disconnect")
+        if self._state == ReceiverState.SCANNING:
+            await self._stop_scan_internal()
+        else:
+            await self._stop_internal()
+        self._state = ReceiverState.DISCONNECTED
+        self._error = "SDR disconnected"
+
+    # ------------------------------------------------------------- shutdown
+
     async def shutdown(self) -> None:
+        await self.stop_monitor()
         async with self._lock:
             await self._stop_internal()
+            await self._stop_scan_internal()
