@@ -191,9 +191,13 @@ html, body {
   min-height: 0;
 }
 
-.gps-panel { flex: 1; }
-.bookmarks-panel { flex: 1.15; overflow: auto; }
-.health-panel { flex: 0.85; overflow: auto; }
+/* GPS and System are fixed-content panels: sized to fit what they actually
+   show, not a proportional share of the column. Saved is the one panel
+   whose content genuinely grows with use, so it absorbs the remaining
+   space and scrolls internally instead. */
+.gps-panel { flex: 0 0 auto; }
+.bookmarks-panel { flex: 1; overflow: auto; min-height: 80px; }
+.health-panel { flex: 0 0 auto; }
 
 /* ---------- Banners ---------- */
 
@@ -385,19 +389,30 @@ input:focus, select:focus, button:focus {
 .kv-list {
   margin: 0;
   display: grid;
-  gap: 6px;
+  gap: 5px;
 }
 
 .kv-row {
   display: flex;
   justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
   font-size: 12.5px;
   border-bottom: 1px dashed var(--border);
-  padding-bottom: 4px;
+  padding-bottom: 3px;
 }
 
-.kv-row dt { color: var(--muted); }
-.kv-row dd { margin: 0; font-family: var(--mono); text-align: right; }
+.kv-row dt { color: var(--muted); flex: none; }
+.kv-row dd {
+  margin: 0;
+  font-family: var(--mono);
+  text-align: right;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ---------- Health panel ---------- */
 
@@ -432,32 +447,6 @@ input:focus, select:focus, button:focus {
 
 .tool-list li.tool-ok::before { background: var(--accent); }
 .tool-list li.tool-missing::before { background: var(--danger); }
-
-.device-list-label {
-  font-size: 11px;
-  color: var(--muted);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  margin-bottom: 6px;
-}
-
-.device-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 5px;
-}
-
-.device-list li {
-  font-size: 12px;
-  padding: 6px 8px;
-  border-radius: 5px;
-  background: var(--panel-bg-raised);
-  border: 1px solid var(--border);
-  font-family: var(--mono);
-}
 
 .muted { color: var(--muted); font-family: inherit; }
 

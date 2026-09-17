@@ -69,13 +69,11 @@ const gpsStatusText = el("gps-status-text");
 const gpsDot = el("gps-dot");
 const gpsLat = el("gps-lat");
 const gpsLon = el("gps-lon");
-const gpsAlt = el("gps-alt");
 const gpsSats = el("gps-sats");
 const gpsDevice = el("gps-device");
 const gpsTime = el("gps-time");
 
 const toolListEl = el("tool-list");
-const deviceListEl = el("device-list");
 
 let activeTab = "tune";
 let selectedMode = "nfm";
@@ -186,20 +184,6 @@ function renderDevices(devices, stale) {
     }
     const stillValid = Array.from(deviceSelect.options).some((o) => o.value === previousSelection);
     if (stillValid) deviceSelect.value = previousSelection;
-  }
-
-  deviceListEl.innerHTML = "";
-  if (devices.length === 0) {
-    const li = document.createElement("li");
-    li.className = "muted";
-    li.textContent = "No devices detected.";
-    deviceListEl.appendChild(li);
-  } else {
-    for (const d of devices) {
-      const li = document.createElement("li");
-      li.textContent = `#${d.index} ${d.name}${d.serial ? " SN:" + d.serial : ""}`;
-      deviceListEl.appendChild(li);
-    }
   }
 }
 
@@ -399,17 +383,16 @@ function applyStatus(data) {
   if (gps.fix) {
     gpsLat.textContent = gps.fix.latitude != null ? gps.fix.latitude.toFixed(5) + "°" : "—";
     gpsLon.textContent = gps.fix.longitude != null ? gps.fix.longitude.toFixed(5) + "°" : "—";
-    gpsAlt.textContent = gps.fix.altitude_m != null ? gps.fix.altitude_m.toFixed(1) + " m" : "—";
     gpsTime.textContent = gps.fix.time || "—";
   } else {
     gpsLat.textContent = "—";
     gpsLon.textContent = "—";
-    gpsAlt.textContent = "—";
     gpsTime.textContent = "—";
   }
   gpsSats.textContent =
     gps.satellites_used != null && gps.satellites_visible != null ? `${gps.satellites_used} / ${gps.satellites_visible}` : "—";
   gpsDevice.textContent = gps.device || "—";
+  gpsDevice.title = gps.device || "";
 
   for (const li of toolListEl.querySelectorAll("li")) {
     const ok = !!tools[li.dataset.tool];
