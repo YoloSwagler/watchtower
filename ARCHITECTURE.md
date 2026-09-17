@@ -460,9 +460,10 @@ Two related Phase 1 issues, both found in the field-test report:
 
 ## Wideband scanner
 
-Revised after the first round of field testing on real hardware (see
-"Field-test note: scanner UX" below) — this section describes the current
-design, not the original Phase 2 delivery.
+Revised after two rounds of field testing on real hardware (UX in the
+first round, process-lifecycle/reliability bugs in the second — see
+"Found on real hardware, not assumed" below) — this section describes the
+current design, not the original Phase 2 delivery.
 
 ### Process & data flow
 
@@ -609,6 +610,53 @@ operator manually switched to WFM). This is a deliberately small,
 frontend-only heuristic — a couple of well-known bands (87.5–108 MHz →
 WFM, 108–137 MHz → AM for civil aviation/VOR), falling back to NFM (Phase
 1's original default) for everything else — not an exhaustive band plan.
+
+### Found on real hardware, not assumed: scan termination could wedge the dongle
+
+Field-testing the persistent-results change above (SSH'd into the actual
+Pi, not just demo mode) surfaced a real, reproducible reliability bug: a
+long continuous tone in place of reception, requiring a full Pi reboot
+(not just restarting Watchtower) to recover, with scanning specifically
+making it worse. Root cause: `_stop_scan_internal()` cancelled
+`_scan_reader_task` (the only thing reading `rtl_power`'s stdout) *before*
+calling `terminate()`, so `rtl_power` could be left trying to flush more
+CSV output into a pipe nobody was draining once SIGTERM arrived — exactly
+the class of bug Phase 1 already found and fixed for `ffmpeg` (see "Audio
+path" above), just not carried over to the newer `rtl_power` pipeline. A
+process stuck like that gets SIGKILL'd by our own `TERMINATE_TIMEOUT`
+fallback, and a SIGKILL while `rtl_power` is mid-USB-transfer with the
+dongle is a plausible way to leave the RTL-SDR in a state only a reboot
+clears (killing the Python process doesn't power-cycle the USB bus; a
+reboot does). Fix: `_stop_scan_internal()` now drains `rtl_power`'s stdout
+during termination the same way `_stop_internal()` already did for
+`ffmpeg`. Confirmed on the real Pi afterward: zero `SIGKILL` fallbacks
+logged across repeated stress-test scan/listen cycles (previously present,
+if intermittent).
+
+### Found on real hardware, not assumed: the SDR stays "busy" for a moment after release
+
+Even with rtl_power/rtl_fm exiting cleanly on SIGTERM (confirmed via the
+log — no "did not exit after SIGTERM" warning), the RTL-SDR's USB
+interface measurably stayed reported as busy for roughly 1–2 seconds
+*after* the process was already gone, before a fresh `rtl_test`/`rtl_fm`/
+`rtl_power` could re-open it — this is USB-level teardown latency in the
+kernel/driver, not something our termination sequence can shorten. Since
+almost every real workflow immediately starts a new pipeline right after
+stopping the old one (selecting a scan signal, returning from listening to
+scan, a live gain change), this was surfacing as "clicking a station
+doesn't work" / "scan doesn't work after listening" — a real, common-path
+failure for something that resolves itself within a couple of seconds.
+Fix: `_start_listening_locked`/`_start_scan_locked` now retry
+(`DEVICE_BUSY_RETRY_ATTEMPTS = 5`, `DEVICE_BUSY_RETRY_DELAY = 1.0`s)
+specifically when the failure is a "device busy" error, rather than
+surfacing it immediately — bounded (definitely fails after ~6s if the
+device is genuinely unavailable for some other reason, e.g. no dongle
+attached at all), and free of any effect on the *first* attempt of a
+normal start (no artificial delay added to the common case). Confirmed on
+the real Pi: the exact same stress-test cycle that previously failed
+roughly every other attempt now succeeds every time, with the retry
+visibly (and only) kicking in on the cycles that would previously have
+failed.
 
 ## Saved frequencies (bookmarks)
 

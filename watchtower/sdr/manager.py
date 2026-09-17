@@ -60,6 +60,24 @@ _RTL_FM_MODE = {
 
 STARTUP_HEALTH_CHECK_DELAY = 0.3
 
+# Found on real hardware: even after rtl_power/rtl_fm exits cleanly on
+# SIGTERM (no SIGKILL fallback needed — that's confirmed by the absence of
+# "did not exit after SIGTERM" in the log), the RTL-SDR's USB interface can
+# stay reported as busy for a few more seconds before the kernel/driver
+# actually finishes releasing it — this is USB-level teardown latency, not
+# something our own termination sequence controls or can speed up. Starting
+# a new pipeline (a scan right after a listen session, a listen session
+# right after a scan, gain changes restarting the pipeline in place) can
+# therefore hit a transient "busy" error for a device we ourselves *just*
+# released. Retrying a few times covers this window instead of surfacing a
+# raw error for something that resolves itself within a few seconds.
+DEVICE_BUSY_RETRY_ATTEMPTS = 5
+DEVICE_BUSY_RETRY_DELAY = 1.0
+
+
+def _is_busy_error(message: str) -> bool:
+    return "busy" in message.lower()
+
 # How often the background hot-plug monitor ticks. Modest on purpose: while
 # a pipeline is active this only ever checks a cached returncode (no
 # subprocess spawned); it only spawns rtl_test (fast, enumeration-only)
@@ -279,54 +297,62 @@ class SDRManager(SDRManagerBase):
         self._error = None
         _, output_rate = _rates_for_mode(params.mode)
 
-        try:
-            rtl_proc = await process.spawn(
-                *_build_rtl_fm_cmd(rtl_fm_path, params),
-                label="rtl_fm",
-                stdin=asyncio.subprocess.DEVNULL,
+        for attempt in range(1, DEVICE_BUSY_RETRY_ATTEMPTS + 1):
+            try:
+                rtl_proc = await process.spawn(
+                    *_build_rtl_fm_cmd(rtl_fm_path, params),
+                    label="rtl_fm",
+                    stdin=asyncio.subprocess.DEVNULL,
+                )
+            except OSError as e:
+                self._state, self._error = ReceiverState.ERROR, f"Failed to start rtl_fm: {e}"
+                return False, self._error
+
+            try:
+                ffmpeg_proc = await process.spawn(
+                    *_build_ffmpeg_cmd(ffmpeg_path, output_rate),
+                    label="ffmpeg",
+                    stdin=asyncio.subprocess.PIPE,
+                )
+            except OSError as e:
+                await rtl_proc.terminate()
+                self._state, self._error = ReceiverState.ERROR, f"Failed to start ffmpeg: {e}"
+                return False, self._error
+
+            pump_task = asyncio.create_task(
+                _pump_pipe(rtl_proc.proc.stdout, ffmpeg_proc.proc.stdin), name="sdr-audio-pump"
             )
-        except OSError as e:
-            self._state, self._error = ReceiverState.ERROR, f"Failed to start rtl_fm: {e}"
-            return False, self._error
 
-        try:
-            ffmpeg_proc = await process.spawn(
-                *_build_ffmpeg_cmd(ffmpeg_path, output_rate),
-                label="ffmpeg",
-                stdin=asyncio.subprocess.PIPE,
+            await asyncio.sleep(STARTUP_HEALTH_CHECK_DELAY)
+            if rtl_proc.proc.returncode is not None or ffmpeg_proc.proc.returncode is not None:
+                stderr_text = (await _read_stderr_text(rtl_proc)) or (await _read_stderr_text(ffmpeg_proc))
+                pump_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pump_task
+                await ffmpeg_proc.terminate()
+                await rtl_proc.terminate()
+                error = _friendly_error(stderr_text)
+                if _is_busy_error(error) and attempt < DEVICE_BUSY_RETRY_ATTEMPTS:
+                    logger.info("SDR busy (likely still releasing); retrying listen start (%d/%d)", attempt, DEVICE_BUSY_RETRY_ATTEMPTS)
+                    await asyncio.sleep(DEVICE_BUSY_RETRY_DELAY)
+                    continue
+                self._state = ReceiverState.ERROR
+                self._error = error
+                logger.warning("listen pipeline failed to start: %s", self._error)
+                return False, self._error
+
+            self._rtl_proc = rtl_proc
+            self._ffmpeg_proc = ffmpeg_proc
+            self._pump_task = pump_task
+            self._params = params
+            self._state = ReceiverState.LISTENING
+            self._device_seen_once = True
+            logger.info(
+                "listening: %.4f MHz mode=%s device=%s", params.frequency_mhz, params.mode.value, params.device_index
             )
-        except OSError as e:
-            await rtl_proc.terminate()
-            self._state, self._error = ReceiverState.ERROR, f"Failed to start ffmpeg: {e}"
-            return False, self._error
+            return True, None
 
-        pump_task = asyncio.create_task(
-            _pump_pipe(rtl_proc.proc.stdout, ffmpeg_proc.proc.stdin), name="sdr-audio-pump"
-        )
-
-        await asyncio.sleep(STARTUP_HEALTH_CHECK_DELAY)
-        if rtl_proc.proc.returncode is not None or ffmpeg_proc.proc.returncode is not None:
-            stderr_text = (await _read_stderr_text(rtl_proc)) or (await _read_stderr_text(ffmpeg_proc))
-            pump_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pump_task
-            await ffmpeg_proc.terminate()
-            await rtl_proc.terminate()
-            self._state = ReceiverState.ERROR
-            self._error = _friendly_error(stderr_text)
-            logger.warning("listen pipeline failed to start: %s", self._error)
-            return False, self._error
-
-        self._rtl_proc = rtl_proc
-        self._ffmpeg_proc = ffmpeg_proc
-        self._pump_task = pump_task
-        self._params = params
-        self._state = ReceiverState.LISTENING
-        self._device_seen_once = True
-        logger.info(
-            "listening: %.4f MHz mode=%s device=%s", params.frequency_mhz, params.mode.value, params.device_index
-        )
-        return True, None
+        return False, self._error  # unreachable: the loop above always returns
 
     async def set_gain(self, gain_db: float | None) -> tuple[bool, str | None]:
         async with self._lock:
@@ -418,49 +444,75 @@ class SDRManager(SDRManagerBase):
         self._state = ReceiverState.STARTING
         self._error = None
 
-        try:
-            scan_proc = await process.spawn(
-                *_build_rtl_power_cmd(rtl_power_path, params),
-                label="rtl_power",
-                stdin=asyncio.subprocess.DEVNULL,
-            )
-        except OSError as e:
-            self._state, self._error = ReceiverState.ERROR, f"Failed to start rtl_power: {e}"
-            return False, self._error
+        for attempt in range(1, DEVICE_BUSY_RETRY_ATTEMPTS + 1):
+            try:
+                scan_proc = await process.spawn(
+                    *_build_rtl_power_cmd(rtl_power_path, params),
+                    label="rtl_power",
+                    stdin=asyncio.subprocess.DEVNULL,
+                )
+            except OSError as e:
+                self._state, self._error = ReceiverState.ERROR, f"Failed to start rtl_power: {e}"
+                return False, self._error
 
-        await asyncio.sleep(STARTUP_HEALTH_CHECK_DELAY)
-        if scan_proc.proc.returncode is not None:
-            stderr_text = await _read_stderr_text(scan_proc)
-            await scan_proc.terminate()
-            self._state = ReceiverState.ERROR
-            self._error = _friendly_error(stderr_text)
-            logger.warning("scan failed to start: %s", self._error)
-            return False, self._error
+            await asyncio.sleep(STARTUP_HEALTH_CHECK_DELAY)
+            if scan_proc.proc.returncode is not None:
+                stderr_text = await _read_stderr_text(scan_proc)
+                await scan_proc.terminate()
+                error = _friendly_error(stderr_text)
+                if _is_busy_error(error) and attempt < DEVICE_BUSY_RETRY_ATTEMPTS:
+                    logger.info("SDR busy (likely still releasing); retrying scan start (%d/%d)", attempt, DEVICE_BUSY_RETRY_ATTEMPTS)
+                    await asyncio.sleep(DEVICE_BUSY_RETRY_DELAY)
+                    continue
+                self._state = ReceiverState.ERROR
+                self._error = error
+                logger.warning("scan failed to start: %s", self._error)
+                return False, self._error
 
-        self._scan_proc = scan_proc
-        self._scan_accumulator = SweepAccumulator()
-        self._scan_engine = ScanEngine(params)  # fresh engine: discards whatever the last scan showed
-        self._scan_reader_task = asyncio.create_task(self._read_scan_output(scan_proc), name="sdr-scan-reader")
-        self._state = ReceiverState.SCANNING
-        self._device_seen_once = True
-        logger.info(
-            "scanning: %.4f-%.4f MHz bin=%.1fkHz device=%s",
-            params.start_mhz, params.end_mhz, params.bin_khz, params.device_index,
-        )  # fmt: skip
-        return True, None
+            self._scan_proc = scan_proc
+            self._scan_accumulator = SweepAccumulator()
+            self._scan_engine = ScanEngine(params)  # fresh engine: discards whatever the last scan showed
+            self._scan_reader_task = asyncio.create_task(self._read_scan_output(scan_proc), name="sdr-scan-reader")
+            self._state = ReceiverState.SCANNING
+            self._device_seen_once = True
+            logger.info(
+                "scanning: %.4f-%.4f MHz bin=%.1fkHz device=%s",
+                params.start_mhz, params.end_mhz, params.bin_khz, params.device_index,
+            )  # fmt: skip
+            return True, None
+
+        return False, self._error  # unreachable: the loop above always returns
 
     async def stop_scan(self) -> None:
         async with self._lock:
             await self._stop_scan_internal()
 
     async def _stop_scan_internal(self) -> None:
+        # Cancelling the reader task below stops it draining rtl_power's
+        # stdout. Like ffmpeg in _stop_internal, rtl_power keeps writing CSV
+        # rows until it actually exits, and its SIGTERM handling can block
+        # on a full, unread stdout pipe once nobody's reading it — drain it
+        # ourselves during termination so SIGTERM can complete instead of
+        # stalling into the SIGKILL fallback. This matters more here than it
+        # first looks: a SIGKILL while rtl_power is mid-USB-transfer with
+        # the dongle can leave the RTL-SDR in a bad state that isn't fixed
+        # by anything short of a reboot (found via real-hardware field
+        # testing — repeated scanning eventually made the dongle
+        # unresponsive until the Pi was rebooted, not just the app restarted).
         if self._scan_reader_task:
             self._scan_reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._scan_reader_task
             self._scan_reader_task = None
         if self._scan_proc:
+            drain_task = None
+            if self._scan_proc.proc.stdout:
+                drain_task = asyncio.create_task(process.drain_discard(self._scan_proc.proc.stdout))
             await self._scan_proc.terminate()
+            if drain_task:
+                drain_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await drain_task
             self._scan_proc = None
         self._scan_accumulator = None
         # self._scan_engine is deliberately left alone — see module docstring.
