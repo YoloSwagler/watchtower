@@ -135,48 +135,68 @@
 
   <aside class="side-column">
 
-    <section class="panel gps-panel">
-      <div class="panel-header">GPS</div>
-      <div class="gps-status-line">
-        <span class="dot" id="gps-dot"></span>
-        <span id="gps-status-text">Checking…</span>
+    <section class="panel gps-panel" id="panel-gps">
+      <div class="panel-header panel-header-toggle" data-panel="gps">
+        <span class="panel-title-group">
+          <span class="panel-chevron">▾</span>
+          <span class="panel-title">GPS</span>
+          <span class="panel-summary" id="gps-summary">—</span>
+        </span>
       </div>
-      <dl class="kv-list">
-        <div class="kv-row"><dt>Latitude</dt><dd id="gps-lat">—</dd></div>
-        <div class="kv-row"><dt>Longitude</dt><dd id="gps-lon">—</dd></div>
-        <div class="kv-row"><dt>Satellites</dt><dd id="gps-sats">—</dd></div>
-        <div class="kv-row"><dt>Device</dt><dd id="gps-device" title="">—</dd></div>
-        <div class="kv-row"><dt>Last update</dt><dd id="gps-time">—</dd></div>
-      </dl>
+      <div class="panel-body">
+        <div class="gps-status-line">
+          <span class="dot" id="gps-dot"></span>
+          <span id="gps-status-text">Checking…</span>
+        </div>
+        <dl class="kv-list">
+          <div class="kv-row"><dt>Latitude</dt><dd id="gps-lat">—</dd></div>
+          <div class="kv-row"><dt>Longitude</dt><dd id="gps-lon">—</dd></div>
+          <div class="kv-row"><dt>Satellites</dt><dd id="gps-sats">—</dd></div>
+          <div class="kv-row"><dt>Device</dt><dd id="gps-device" title="">—</dd></div>
+          <div class="kv-row"><dt>Last update</dt><dd id="gps-time">—</dd></div>
+        </dl>
+      </div>
     </section>
 
-    <section class="panel bookmarks-panel">
-      <div class="panel-header">
-        Saved
+    <section class="panel bookmarks-panel" id="panel-bookmarks">
+      <div class="panel-header panel-header-toggle" data-panel="bookmarks">
+        <span class="panel-title-group">
+          <span class="panel-chevron">▾</span>
+          <span class="panel-title">Saved</span>
+          <span class="panel-summary" id="bookmarks-summary">—</span>
+        </span>
         <button id="btn-save-current" class="btn-tiny" type="button" disabled>+ Save Current</button>
       </div>
-      <div id="bookmark-save-row" class="bookmark-save-row" hidden>
-        <input id="bookmark-save-name" type="text" placeholder="Name this frequency" maxlength="40">
-        <button id="bookmark-save-confirm" class="btn-tiny" type="button">Save</button>
-        <button id="bookmark-save-cancel" class="btn-tiny" type="button">Cancel</button>
+      <div class="panel-body">
+        <div id="bookmark-save-row" class="bookmark-save-row" hidden>
+          <input id="bookmark-save-name" type="text" placeholder="Name this frequency" maxlength="40">
+          <button id="bookmark-save-confirm" class="btn-tiny" type="button">Save</button>
+          <button id="bookmark-save-cancel" class="btn-tiny" type="button">Cancel</button>
+        </div>
+        <ul class="bookmark-list" id="bookmark-list">
+          <li class="muted">No saved frequencies yet.</li>
+        </ul>
       </div>
-      <ul class="bookmark-list" id="bookmark-list">
-        <li class="muted">No saved frequencies yet.</li>
-      </ul>
     </section>
 
-    <section class="panel health-panel">
-      <div class="panel-header">
-        System
+    <section class="panel health-panel" id="panel-system">
+      <div class="panel-header panel-header-toggle" data-panel="system">
+        <span class="panel-title-group">
+          <span class="panel-chevron">▾</span>
+          <span class="panel-title">System</span>
+          <span class="panel-summary" id="system-summary">—</span>
+        </span>
         <button id="btn-refresh-devices" class="btn btn-tiny" type="button">Refresh</button>
       </div>
-      <ul class="tool-list" id="tool-list">
-        <li data-tool="rtl_test">rtl_test</li>
-        <li data-tool="rtl_fm">rtl_fm</li>
-        <li data-tool="rtl_power">rtl_power</li>
-        <li data-tool="ffmpeg">ffmpeg</li>
-        <li data-tool="gpsd">gpsd</li>
-      </ul>
+      <div class="panel-body">
+        <ul class="tool-list" id="tool-list">
+          <li data-tool="rtl_test">rtl_test</li>
+          <li data-tool="rtl_fm">rtl_fm</li>
+          <li data-tool="rtl_power">rtl_power</li>
+          <li data-tool="ffmpeg">ffmpeg</li>
+          <li data-tool="gpsd">gpsd</li>
+        </ul>
+      </div>
     </section>
 
   </aside>

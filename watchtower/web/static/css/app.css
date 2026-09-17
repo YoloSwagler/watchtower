@@ -149,7 +149,68 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
+  flex: none;
 }
+
+/* ---------- Collapsible side panels (GPS / Saved / System) ---------- */
+
+.panel-header-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+
+.panel-header-toggle:hover .panel-title { color: var(--text); }
+
+.panel-title-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.panel-title { flex: none; }
+
+.panel-chevron {
+  flex: none;
+  display: inline-block;
+  font-size: 9px;
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.panel.collapsed .panel-chevron { transform: rotate(-90deg); }
+
+.panel-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.text-ok { color: var(--accent); }
+.text-warn { color: var(--warning); }
+.text-error { color: var(--danger); }
+
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.panel.collapsed .panel-body { display: none; }
+/* Two classes beats bookmarks-panel's one-class `flex: 1` rule, so a
+   collapsed panel always shrinks to its header regardless of which panel
+   it is — no !important needed. */
+.panel.collapsed { flex: 0 0 auto; }
 
 /* ---------- Tabs / mode views ---------- */
 
@@ -194,9 +255,9 @@ html, body {
 /* GPS and System are fixed-content panels: sized to fit what they actually
    show, not a proportional share of the column. Saved is the one panel
    whose content genuinely grows with use, so it absorbs the remaining
-   space and scrolls internally instead. */
+   space; its .panel-body (not the section itself) is what scrolls. */
 .gps-panel { flex: 0 0 auto; }
-.bookmarks-panel { flex: 1; overflow: auto; min-height: 80px; }
+.bookmarks-panel { flex: 1; min-height: 80px; }
 .health-panel { flex: 0 0 auto; }
 
 /* ---------- Banners ---------- */

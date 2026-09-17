@@ -72,8 +72,13 @@ const gpsLon = el("gps-lon");
 const gpsSats = el("gps-sats");
 const gpsDevice = el("gps-device");
 const gpsTime = el("gps-time");
+const gpsSummaryEl = el("gps-summary");
 
 const toolListEl = el("tool-list");
+const systemSummaryEl = el("system-summary");
+const bookmarksSummaryEl = el("bookmarks-summary");
+
+const collapsiblePanelHeaders = Array.from(document.querySelectorAll(".panel-header-toggle"));
 
 let activeTab = "tune";
 let selectedMode = "nfm";
@@ -99,6 +104,53 @@ function setPillState(pillEl, stateClass, valueText) {
   pillEl.classList.remove("state-ok", "state-warn", "state-error", "state-disconnected");
   if (stateClass) pillEl.classList.add(stateClass);
   pillEl.querySelector(".pill-value").textContent = valueText;
+}
+
+function setSummaryText(summaryEl, text, stateClass) {
+  summaryEl.textContent = text;
+  summaryEl.classList.remove("text-ok", "text-warn", "text-error");
+  const textClass = stateClass === "state-ok" ? "text-ok" : stateClass === "state-warn" ? "text-warn" : stateClass === "state-error" ? "text-error" : "";
+  if (textClass) summaryEl.classList.add(textClass);
+}
+
+// Collapsible side panels (GPS / Saved / System): each header toggles its
+// own panel only (not a single-open accordion), state remembered per
+// panel across reloads. localStorage is a per-viewer convenience here —
+// if it's unavailable (private browsing, etc.) panels just fall back to
+// their default open/closed state every load, which is harmless.
+const PANEL_STORAGE_PREFIX = "watchtower.panel.";
+const PANEL_DEFAULT_COLLAPSED = { gps: false, bookmarks: false, system: true };
+
+function loadPanelCollapsed(name) {
+  try {
+    const v = localStorage.getItem(PANEL_STORAGE_PREFIX + name);
+    if (v === "collapsed") return true;
+    if (v === "expanded") return false;
+  } catch (err) {
+    /* localStorage unavailable; fall through to default */
+  }
+  return PANEL_DEFAULT_COLLAPSED[name] ?? false;
+}
+
+function setPanelCollapsed(header, collapsed) {
+  const panel = header.closest(".panel");
+  panel.classList.toggle("collapsed", collapsed);
+  header.setAttribute("aria-expanded", String(!collapsed));
+  try {
+    localStorage.setItem(PANEL_STORAGE_PREFIX + header.dataset.panel, collapsed ? "collapsed" : "expanded");
+  } catch (err) {
+    /* non-fatal: state just won't persist across reloads */
+  }
+}
+
+function initCollapsiblePanels() {
+  for (const header of collapsiblePanelHeaders) {
+    setPanelCollapsed(header, loadPanelCollapsed(header.dataset.panel));
+    header.addEventListener("click", () => {
+      const panel = header.closest(".panel");
+      setPanelCollapsed(header, !panel.classList.contains("collapsed"));
+    });
+  }
 }
 
 function showError(message) {
@@ -220,6 +272,8 @@ function renderSignals(scan) {
 }
 
 function renderBookmarks() {
+  bookmarksSummaryEl.textContent = bookmarksCache.length === 0 ? "none" : `${bookmarksCache.length} saved`;
+
   bookmarkListEl.innerHTML = "";
   if (bookmarksCache.length === 0) {
     const li = document.createElement("li");
@@ -379,6 +433,7 @@ function applyStatus(data) {
   gpsStatusText.textContent = gpsLabel;
   gpsStatusLine.className = "gps-status-line " + gpsClass;
   gpsDot.className = "dot";
+  setSummaryText(gpsSummaryEl, gpsLabel, gpsClass);
 
   if (gps.fix) {
     gpsLat.textContent = gps.fix.latitude != null ? gps.fix.latitude.toFixed(5) + "°" : "—";
@@ -394,11 +449,19 @@ function applyStatus(data) {
   gpsDevice.textContent = gps.device || "—";
   gpsDevice.title = gps.device || "";
 
-  for (const li of toolListEl.querySelectorAll("li")) {
+  let okCount = 0;
+  const toolItems = toolListEl.querySelectorAll("li");
+  for (const li of toolItems) {
     const ok = !!tools[li.dataset.tool];
+    if (ok) okCount += 1;
     li.classList.toggle("tool-ok", ok);
     li.classList.toggle("tool-missing", !ok);
   }
+  setSummaryText(
+    systemSummaryEl,
+    `${okCount}/${toolItems.length} OK`,
+    okCount === toolItems.length ? "state-ok" : "state-warn"
+  );
 }
 
 async function refreshStatus() {
@@ -680,10 +743,16 @@ modeButtons.forEach((btn) => btn.addEventListener("click", () => setActiveMode(b
 btnStart.addEventListener("click", startListening);
 btnStop.addEventListener("click", stopListening);
 btnReturnToScan.addEventListener("click", returnToScan);
-btnRefreshDevices.addEventListener("click", refreshDevices);
+btnRefreshDevices.addEventListener("click", (e) => {
+  e.stopPropagation(); // lives inside a collapsible panel header; don't also toggle it
+  refreshDevices();
+});
 btnScanStart.addEventListener("click", startScan);
 btnScanStop.addEventListener("click", stopScan);
-btnSaveCurrent.addEventListener("click", openSaveCurrentRow);
+btnSaveCurrent.addEventListener("click", (e) => {
+  e.stopPropagation(); // lives inside a collapsible panel header; don't also toggle it
+  openSaveCurrentRow();
+});
 btnBookmarkSaveConfirm.addEventListener("click", confirmSaveCurrent);
 btnBookmarkSaveCancel.addEventListener("click", closeSaveCurrentRow);
 bookmarkSaveNameInput.addEventListener("keydown", (e) => {
@@ -701,6 +770,7 @@ function updateClock() {
 }
 
 populateGainSelect();
+initCollapsiblePanels();
 setActiveMode("nfm");
 setActiveTab("tune");
 renderFreqReadout();
