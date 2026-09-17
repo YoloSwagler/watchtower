@@ -64,6 +64,7 @@ def _scan_snapshot_to_dict(scan: ScanSnapshot | None) -> dict | None:
         "bin_khz": scan.bin_khz,
         "noise_floor_db": scan.noise_floor_db,
         "last_sweep_at": scan.last_sweep_at,
+        "current_freq_mhz": scan.current_freq_mhz,
         "signals": [
             {
                 "frequency_mhz": s.frequency_mhz,
@@ -89,7 +90,7 @@ def _sdr_snapshot_to_dict(snap: SDRSnapshot) -> dict:
         "hf_advisory": snap.hf_advisory,
         "hf_advisory_threshold_mhz": HF_ADVISORY_THRESHOLD_MHZ,
         "scan": _scan_snapshot_to_dict(snap.scan),
-        "can_resume_scan": snap.can_resume_scan,
+        "has_scan_results": snap.has_scan_results,
     }
 
 
@@ -259,14 +260,6 @@ async def stop_scan(request: web.Request) -> web.Response:
     return web.json_response({"status": "stopped"})
 
 
-async def resume_scan(request: web.Request) -> web.Response:
-    sdr = request.app[SDR_KEY]
-    ok, error = await sdr.resume_scan()
-    if not ok:
-        return web.json_response({"status": "error", "message": error}, status=409)
-    return web.json_response({"status": "scanning"})
-
-
 async def list_bookmarks(request: web.Request) -> web.Response:
     store = request.app[BOOKMARKS_KEY]
     bookmarks = await store.list()
@@ -378,7 +371,6 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/sdr/listen/gain", set_gain)
     app.router.add_post("/api/sdr/scan/start", start_scan)
     app.router.add_post("/api/sdr/scan/stop", stop_scan)
-    app.router.add_post("/api/sdr/scan/resume", resume_scan)
     app.router.add_get("/api/bookmarks", list_bookmarks)
     app.router.add_post("/api/bookmarks", create_bookmark)
     app.router.add_put("/api/bookmarks/{id}", update_bookmark)

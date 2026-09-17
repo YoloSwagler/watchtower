@@ -61,7 +61,10 @@ class SDRSnapshot:
     error: str | None = None
     hf_advisory: bool = False
     scan: "ScanSnapshot | None" = None
-    can_resume_scan: bool = False
+    # Whether there are scan results to show (from the current scan, or the
+    # last one before it was stopped) — not whether a scan can be silently
+    # auto-restarted. See ARCHITECTURE.md, "Wideband scanner".
+    has_scan_results: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,7 @@ class ScanSnapshot:
     bin_khz: float
     noise_floor_db: float | None
     last_sweep_at: float | None
+    current_freq_mhz: float | None = None
     signals: list[TrackedSignalView] = field(default_factory=list)
 
 
@@ -124,14 +128,6 @@ class SDRManagerBase(ABC):
 
     @abstractmethod
     async def stop_scan(self) -> None: ...
-
-    @abstractmethod
-    async def resume_scan(self) -> tuple[bool, str | None]:
-        """Restart the most recently stopped scan (e.g. after a listen
-        session started from a detected signal ends). Returns
-        (ok, error_message); ok=False if there is no remembered scan.
-        """
-        ...
 
     @abstractmethod
     def audio_stream(self):

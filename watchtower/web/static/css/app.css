@@ -542,6 +542,16 @@ input:focus, select:focus, button:focus {
   margin: 10px 0 8px;
 }
 
+.scan-current-freq {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.scan-current-freq.is-live {
+  color: var(--accent);
+  font-weight: 700;
+}
+
 .signal-table-wrap {
   flex: 1;
   overflow-y: auto;

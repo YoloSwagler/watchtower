@@ -52,6 +52,7 @@ const scanEndInput = el("scan-end-input");
 const scanBinSelect = el("scan-bin-select");
 const btnScanStart = el("btn-scan-start");
 const btnScanStop = el("btn-scan-stop");
+const scanCurrentFreqEl = el("scan-current-freq");
 const scanNoiseFloorEl = el("scan-noise-floor");
 const scanSignalCountEl = el("scan-signal-count");
 const scanLastSweepEl = el("scan-last-sweep");
@@ -89,6 +90,11 @@ let bookmarksCache = [];
 let editingBookmarkId = null;
 let confirmingDeleteId = null;
 let confirmingDeleteTimer = null;
+// True only right after selecting a signal from the scan table — that's
+// the one path "Return to Scan" should be offered from, not every time
+// the operator happens to be on the Tune tab. Reset whenever a listen
+// session starts some other way (manual tune, a saved bookmark).
+let cameFromScanSelection = false;
 
 const GPS_LABELS = {
   no_device: "No GPS device",
@@ -119,7 +125,7 @@ function setSummaryText(summaryEl, text, stateClass) {
 // if it's unavailable (private browsing, etc.) panels just fall back to
 // their default open/closed state every load, which is harmless.
 const PANEL_STORAGE_PREFIX = "watchtower.panel.";
-const PANEL_DEFAULT_COLLAPSED = { gps: false, bookmarks: false, system: true };
+const PANEL_DEFAULT_COLLAPSED = { gps: true, bookmarks: false, system: true };
 
 function loadPanelCollapsed(name) {
   try {
@@ -197,6 +203,17 @@ function populateGainSelect() {
 
 function currentGainDb() {
   return gainInput.value === "" ? null : parseFloat(gainInput.value);
+}
+
+// A deliberately small, well-known-bands-only heuristic — not an
+// exhaustive band plan. Anything outside these falls back to NFM (the
+// same default Phase 1 always used), so unmatched frequencies behave
+// exactly as before. Used only when picking up a signal from the scan
+// table; a saved bookmark's own stored mode is never overridden.
+function guessModeForFrequency(freqMhz) {
+  if (freqMhz >= 87.5 && freqMhz <= 108.0) return "wfm"; // FM broadcast
+  if (freqMhz >= 108.0 && freqMhz <= 137.0) return "am"; // civil aviation / VOR
+  return "nfm";
 }
 
 function getFormParams() {
@@ -382,7 +399,8 @@ function applyStatus(data) {
   btnStop.disabled = sdr.state !== "listening" && sdr.state !== "starting";
   btnScanStart.disabled = busyOrGone;
   btnScanStop.disabled = sdr.state !== "scanning";
-  btnReturnToScan.hidden = !sdr.can_resume_scan || sdr.state === "scanning" || sdr.state === "starting";
+  btnReturnToScan.hidden =
+    !cameFromScanSelection || !sdr.has_scan_results || sdr.state === "scanning" || sdr.state === "starting";
   btnReturnToScan.disabled = sdr.state === "disconnected";
 
   if (sdr.error) {
@@ -413,6 +431,10 @@ function applyStatus(data) {
   renderDevices(sdr.devices, sdr.devices_stale);
   renderSignals(sdr.scan);
 
+  const scanIsLive = sdr.state === "scanning";
+  scanCurrentFreqEl.textContent =
+    "Scanning: " + (scanIsLive && sdr.scan && sdr.scan.current_freq_mhz != null ? sdr.scan.current_freq_mhz.toFixed(4) + " MHz" : "—");
+  scanCurrentFreqEl.classList.toggle("is-live", scanIsLive);
   scanNoiseFloorEl.textContent = "Noise floor: " + (sdr.scan && sdr.scan.noise_floor_db != null ? sdr.scan.noise_floor_db.toFixed(1) + " dBm" : "—");
   scanSignalCountEl.textContent = "Signals: " + (sdr.scan ? sdr.scan.signals.length : "—");
   scanLastSweepEl.textContent = "Last sweep: " + (sdr.scan ? formatAgeSeconds(sdr.scan.last_sweep_at) : "—");
@@ -530,6 +552,7 @@ async function startListening() {
     showError("Enter a valid frequency first.");
     return;
   }
+  cameFromScanSelection = false; // a manual tune, not a pickup from the scan table
   await startListeningWithParams(params);
   await refreshStatus();
 }
@@ -549,17 +572,21 @@ async function stopListening() {
 async function selectSignal(frequencyMhz) {
   const ok = await startListeningWithParams({
     frequency_mhz: frequencyMhz,
-    mode: selectedMode,
+    mode: guessModeForFrequency(frequencyMhz),
     device_index: parseInt(deviceSelect.value || "0", 10),
     gain_db: currentGainDb(),
     squelch: parseInt(squelchInput.value || "0", 10),
     ppm: parseInt(ppmInput.value || "0", 10),
   });
-  if (ok) setActiveTab("tune");
+  if (ok) {
+    cameFromScanSelection = true;
+    setActiveTab("tune");
+  }
   await refreshStatus();
 }
 
 async function selectBookmark(b) {
+  cameFromScanSelection = false; // a saved preset, not a pickup from the scan table
   const ok = await startListeningWithParams({
     frequency_mhz: b.frequency_mhz,
     mode: b.mode,
@@ -605,24 +632,23 @@ async function stopScan() {
 }
 
 async function returnToScan() {
+  // Just releases the SDR (if listening) and switches to the scan tab —
+  // the last scan's results are already sitting in /api/status (they
+  // persist until a new scan starts), so there's nothing to restart here.
+  // Hit "Start Scan" to actually sweep again.
   clearError();
-  try {
-    if (currentSdrState === "listening" || currentSdrState === "starting") {
+  if (currentSdrState === "listening" || currentSdrState === "starting") {
+    try {
       await fetch("/api/sdr/listen/stop", { method: "POST" });
-      audioPlayer.pause();
-      audioPlayer.removeAttribute("src");
-      audioPlayer.load();
+    } catch (err) {
+      showError("Could not reach the Watchtower server.");
     }
-    const res = await fetch("/api/sdr/scan/resume", { method: "POST" });
-    const data = await res.json();
-    if (!res.ok || data.status === "error") {
-      showError(data.message || "No previous scan to resume.");
-      return;
-    }
-    setActiveTab("scan");
-  } catch (err) {
-    showError("Could not reach the Watchtower server.");
+    audioPlayer.pause();
+    audioPlayer.removeAttribute("src");
+    audioPlayer.load();
   }
+  cameFromScanSelection = false;
+  setActiveTab("scan");
   await refreshStatus();
 }
 

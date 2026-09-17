@@ -9,10 +9,14 @@ listening cue that "tuning" changed something. If ffmpeg isn't available on
 the dev machine, demo mode still simulates tuning/state but reports no audio
 — it never fakes bytes as if they came from ffmpeg.
 
-Demo scanning generates synthetic sweep data (watchtower/scanner/
-demo_source.py — the only place RF data is fabricated) and runs it through
-the exact same noise-floor/signal-detection/tracking pipeline real scanning
-uses, so the rest of the scan code path is genuinely exercised too.
+Demo scanning steps through the requested range in hop-sized chunks (see
+scanner/demo_source.py, the only place RF data is fabricated) and feeds
+each synthetic hop through the same ScanEngine real scanning uses, so the
+rest of the scan code path — including signals appearing incrementally as
+hops arrive — is genuinely exercised too, not separately faked.
+
+Like the real manager, scan results (the ScanEngine) survive stop_scan();
+see sdr/manager.py's module docstring.
 """
 
 from __future__ import annotations
@@ -23,10 +27,9 @@ import time
 from dataclasses import replace
 
 from watchtower.logging_setup import get_logger
-from watchtower.scanner import detect as scanner_detect
-from watchtower.scanner.base import ScanParams, validate_scan_range
-from watchtower.scanner.demo_source import generate_demo_sweep
-from watchtower.scanner.tracker import SignalTracker
+from watchtower.scanner import demo_source
+from watchtower.scanner.base import ScanParams, Sweep, validate_scan_range
+from watchtower.scanner.engine import ScanEngine
 from watchtower.sdr import detect, process
 from watchtower.sdr.base import (
     HF_ADVISORY_THRESHOLD_MHZ,
@@ -44,7 +47,9 @@ logger = get_logger("sdr.demo")
 
 DEMO_DEVICES = [SDRDevice(index=0, name="Demo RTL2838UHIDIR (simulated)", serial="DEMO0001")]
 
-DEMO_SCAN_TICK_SECONDS = 1.0
+# Time between simulated hops — mirrors how real scanning arrives as a
+# stream of hop-sized chunks, not one full-range update at a time.
+DEMO_HOP_TICK_SECONDS = 0.6
 
 
 def _demo_tone_hz(frequency_mhz: float) -> int:
@@ -66,13 +71,10 @@ class DemoSDRManager(SDRManagerBase):
         self._audio_client_lock = asyncio.Lock()
         self._audio_client_active = False
 
-        # Scan pipeline
-        self._scan_params: ScanParams | None = None
-        self._last_scan_params: ScanParams | None = None
-        self._scan_tracker: SignalTracker | None = None
-        self._scan_noise_floor_db: float | None = None
-        self._scan_last_sweep_at: float | None = None
-        self._scan_signals: list = []
+        # Scan pipeline. _scan_engine deliberately outlives stop_scan() —
+        # see sdr/manager.py's module docstring — replaced only by the
+        # next start_scan().
+        self._scan_engine: ScanEngine | None = None
         self._scan_task: asyncio.Task | None = None
         self._scan_start_time: float = 0.0
 
@@ -81,13 +83,15 @@ class DemoSDRManager(SDRManagerBase):
     async def snapshot(self) -> SDRSnapshot:
         hf_advisory = bool(self._params and self._params.frequency_mhz < HF_ADVISORY_THRESHOLD_MHZ)
         scan_snapshot = None
-        if self._scan_params is not None:
+        if self._scan_engine is not None:
+            engine = self._scan_engine
             scan_snapshot = ScanSnapshot(
-                start_mhz=self._scan_params.start_mhz,
-                end_mhz=self._scan_params.end_mhz,
-                bin_khz=self._scan_params.bin_khz,
-                noise_floor_db=self._scan_noise_floor_db,
-                last_sweep_at=self._scan_last_sweep_at,
+                start_mhz=engine.params.start_mhz,
+                end_mhz=engine.params.end_mhz,
+                bin_khz=engine.params.bin_khz,
+                noise_floor_db=engine.noise_floor_db,
+                last_sweep_at=engine.last_sweep_at,
+                current_freq_mhz=engine.current_freq_mhz if self._state == ReceiverState.SCANNING else None,
                 signals=[
                     TrackedSignalView(
                         frequency_mhz=s.frequency_hz / 1_000_000,
@@ -97,7 +101,7 @@ class DemoSDRManager(SDRManagerBase):
                         first_seen=s.first_seen,
                         last_seen=s.last_seen,
                     )
-                    for s in self._scan_signals
+                    for s in engine.signals
                 ],
             )
         return SDRSnapshot(
@@ -109,7 +113,7 @@ class DemoSDRManager(SDRManagerBase):
             error=self._error,
             hf_advisory=hf_advisory,
             scan=scan_snapshot,
-            can_resume_scan=self._last_scan_params is not None,
+            has_scan_results=self._scan_engine is not None,
         )
 
     async def refresh_devices(self) -> list[SDRDevice]:
@@ -222,12 +226,7 @@ class DemoSDRManager(SDRManagerBase):
         self._error = None
         await asyncio.sleep(0.15)  # simulate tuning delay, matching start_listening
 
-        match_tolerance_hz = max(params.bin_khz * 1000 * 2, 5000)
-        self._scan_params = params
-        self._scan_tracker = SignalTracker(match_tolerance_hz=match_tolerance_hz)
-        self._scan_noise_floor_db = None
-        self._scan_last_sweep_at = None
-        self._scan_signals = []
+        self._scan_engine = ScanEngine(params)  # fresh engine: discards whatever the last scan showed
         self._scan_start_time = time.monotonic()
         self._scan_task = asyncio.create_task(self._scan_loop(params), name="demo-scan-loop")
         self._state = ReceiverState.SCANNING
@@ -240,42 +239,43 @@ class DemoSDRManager(SDRManagerBase):
         async with self._lock:
             await self._stop_scan_internal()
 
-    async def resume_scan(self) -> tuple[bool, str | None]:
-        async with self._lock:
-            if self._last_scan_params is None:
-                return False, "No previous scan to resume."
-            return await self._start_scan_locked(self._last_scan_params)
-
     async def _stop_scan_internal(self) -> None:
         if self._scan_task:
             self._scan_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._scan_task
             self._scan_task = None
-        if self._scan_params is not None:
-            self._last_scan_params = self._scan_params
-        self._scan_params = None
-        self._scan_tracker = None
-        self._scan_noise_floor_db = None
-        self._scan_last_sweep_at = None
-        self._scan_signals = []
+        # self._scan_engine is deliberately left alone — see sdr/manager.py.
         if self._state in (ReceiverState.SCANNING, ReceiverState.STARTING):
             self._state = ReceiverState.IDLE
 
     async def _scan_loop(self, params: ScanParams) -> None:
+        """Steps through the requested range in hop-sized chunks (like real
+        rtl_power), feeding each hop to ScanEngine as it's generated so
+        signals appear incrementally instead of only once a full pass
+        completes, then rolls into the next pass.
+        """
         try:
             while True:
-                await asyncio.sleep(DEMO_SCAN_TICK_SECONDS)
-                if self._scan_tracker is None:
-                    return
-                t = time.monotonic() - self._scan_start_time
-                sweep = generate_demo_sweep(params, t)
-                noise_floor = scanner_detect.estimate_noise_floor(sweep.powers_db)
-                detected = scanner_detect.find_signals(sweep, noise_floor)
-                now = time.time()
-                self._scan_signals = self._scan_tracker.update(detected, now=now)
-                self._scan_noise_floor_db = noise_floor
-                self._scan_last_sweep_at = now
+                hop_freqs: list[float] = []
+                hop_powers: list[float] = []
+                last_hop: Sweep | None = None
+                for hop_start_hz, hop_end_hz in demo_source.iter_demo_hops(params):
+                    await asyncio.sleep(DEMO_HOP_TICK_SECONDS)
+                    if self._scan_engine is None:
+                        return
+                    t = time.monotonic() - self._scan_start_time
+                    hop = demo_source.generate_demo_hop(params, t, hop_start_hz, hop_end_hz)
+                    self._scan_engine.ingest_hop(hop, time.time())
+                    hop_freqs.extend(hop.freqs_hz)
+                    hop_powers.extend(hop.powers_db)
+                    last_hop = hop
+                if last_hop is not None and self._scan_engine is not None:
+                    full_sweep = Sweep(
+                        timestamp_key=last_hop.timestamp_key, freqs_hz=hop_freqs, powers_db=hop_powers,
+                        bin_hz=last_hop.bin_hz,
+                    )  # fmt: skip
+                    self._scan_engine.complete_sweep(full_sweep, time.time())
         except asyncio.CancelledError:
             pass
 

@@ -82,11 +82,50 @@ async def test_real_scan_pipeline_parses_signals_and_cleans_up(fake_rtl_power, m
 
         assert snap.scan.signals[0].power_db == pytest.approx(-60.0)
         assert snap.scan.noise_floor_db is not None
+        assert snap.scan.current_freq_mhz is not None
     finally:
         await mgr.shutdown()
 
     snap = await mgr.snapshot()
     assert snap.state == ReceiverState.IDLE
+
+
+async def test_stop_scan_persists_results_until_the_next_start_scan(fake_rtl_power, monkeypatch):
+    monkeypatch.setattr("watchtower.sdr.manager.detect.find_rtl_power", lambda: fake_rtl_power)
+    mgr = SDRManager()
+    try:
+        ok, error = await mgr.start_scan(ScanParams(start_mhz=88.0, end_mhz=88.05, bin_khz=25.0))
+        assert ok, error
+
+        for _ in range(50):
+            snap = await mgr.snapshot()
+            if snap.scan and snap.scan.signals:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("no signals parsed from fake rtl_power output within timeout")
+        signals_before_stop = snap.scan.signals
+
+        await mgr.stop_scan()
+
+        snap = await mgr.snapshot()
+        assert snap.state == ReceiverState.IDLE
+        assert snap.scan is not None  # last results stick around, not cleared
+        assert snap.scan.signals == signals_before_stop
+        assert snap.scan.current_freq_mhz is None
+        assert snap.has_scan_results is True
+
+        # A fresh start_scan() replaces the engine — proven by the reported
+        # range changing to the new params (the fake tool ignores its argv
+        # and always emits the same canned 88 MHz line, so we can't assert
+        # on signals content here without racing the reader task; the
+        # range field is populated purely from the Python-side params).
+        ok, error = await mgr.start_scan(ScanParams(start_mhz=200.0, end_mhz=200.05, bin_khz=25.0))
+        assert ok, error
+        snap = await mgr.snapshot()
+        assert snap.scan.start_mhz == 200.0
+    finally:
+        await mgr.shutdown()
 
 
 async def test_scan_start_fails_cleanly_when_rtl_power_missing(monkeypatch):
@@ -115,12 +154,21 @@ async def test_monitor_tick_detects_scan_process_dying_unexpectedly(fake_rtl_pow
         else:
             pytest.fail("fake rtl_power never exited")
 
+        # Grab the results the scan had found before it died, so we can
+        # confirm they survive the disconnect below.
+        pre_disconnect_signals = (await mgr.snapshot()).scan.signals
+
         await mgr._monitor_tick()
 
         snap = await mgr.snapshot()
         assert snap.state == ReceiverState.DISCONNECTED
         assert snap.error == "SDR disconnected"
-        assert snap.scan is None
+        # Last known scan results persist through a disconnect, same as a
+        # deliberate stop — only a new start_scan() replaces them.
+        assert snap.scan is not None
+        assert snap.scan.signals == pre_disconnect_signals
+        assert snap.scan.current_freq_mhz is None  # not "currently scanning" once disconnected
+        assert snap.has_scan_results is True
     finally:
         await mgr.shutdown()
 

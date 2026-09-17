@@ -460,37 +460,43 @@ Two related Phase 1 issues, both found in the field-test report:
 
 ## Wideband scanner
 
+Revised after the first round of field testing on real hardware (see
+"Field-test note: scanner UX" below) — this section describes the current
+design, not the original Phase 2 delivery.
+
 ### Process & data flow
 
 ```
 rtl_power -f START:END:BIN -i 4 (-g GAIN) (-p PPM) -d DEV -   (CSV rows on stdout)
         |
         v
-SweepAccumulator   (watchtower/scanner/parser.py)
-  groups consecutive CSV rows sharing one (date, time) stamp — rtl_power
-  emits one row per hop, and a wide requested range needs several hops
-  (its own hop width is capped ~2.8 MHz) — into one complete Sweep once a
-  new timestamp starts.
+one row = one hop's bins (rtl_power's own hop width is capped ~2.8 MHz,
+so a wide requested range arrives as a stream of hops, not one update)
         |
+        +----------------------------------------+
+        v                                        v
+ScanEngine.ingest_hop (every hop)      SweepAccumulator.ingest (every row)
+  runs find_signals on just this         groups hops sharing one
+  hop's bins immediately — this is       (date, time) stamp into one
+  what makes signals appear as           full Sweep once a complete
+  rtl_power streams hops in, not         pass across the range finishes
+  only once a full pass completes                |
+        |                                        v
+        |                          ScanEngine.complete_sweep
+        |                            refreshes noise_floor_db from the
+        |                            full range's bins (far more stable
+        |                            than any one ~100-bin hop) and sets
+        |                            last_sweep_at
         v
-estimate_noise_floor + find_signals   (watchtower/scanner/detect.py)
-  pure functions over a Sweep: noise floor = median power across the
-  sweep (intentionally the simplest reasonable estimator — see "Signal
-  detection approach" below); bins >= noise_floor + threshold_db are
-  "active"; adjacent active bins are grouped into one DetectedSignal
-  (peak frequency, peak power, approx bandwidth, SNR).
-        |
-        v
-SignalTracker   (watchtower/scanner/tracker.py)
-  matches each sweep's DetectedSignals against previously tracked ones by
-  frequency proximity, updates power/SNR/last_seen, expires entries not
-  re-observed within TTL_SECONDS. This is what turns "one sweep's peaks"
-  into a stable, decaying signal list rather than a list that flickers
-  and regrows every sweep cycle.
-        |
-        v
-SDRManager._scan_signals (cached, read by /api/status)
+ScanEngine.signals / .current_freq_mhz  (watchtower/scanner/engine.py)
+  SignalTracker-backed live state, read by /api/status
 ```
+
+`ScanEngine` (`watchtower/scanner/engine.py`) is the one place "how do
+sweep chunks become live UI state" is implemented, and both `SDRManager`
+(fed real hop lines) and `DemoSDRManager` (fed synthetic hops — see "Demo
+scanning" below) drive the same instance type, so real and demo scanning
+behave identically from the engine down.
 
 `rtl_power` is spawned and torn down exactly like `rtl_fm`/`ffmpeg`
 (`process.spawn`, `ManagedProcess`, `os.killpg` on stop) — no new
@@ -505,54 +511,104 @@ and CPU on the Pi 4B.
 
 ### Signal detection approach (intentionally simple)
 
-- **Noise floor**: median power across the whole sweep. A global median is
-  crude compared to a per-band rolling floor, but it is one line of code,
-  easy to reason about, and good enough for "help the operator see what's
-  active" — not a calibrated measurement. This is written down explicitly
-  so a future phase doesn't mistake it for more than it is.
+- **Noise floor**: median power, refreshed once per full sweep across the
+  whole requested range (not per hop — a single hop's ~100 bins is a
+  noisier sample than the full range's). The very first hop of the very
+  first scan has no full-sweep floor yet, so `ScanEngine.ingest_hop`
+  bootstraps from that hop's own local median until the first
+  `complete_sweep` call. A global median is still crude compared to a
+  per-band rolling floor, but it's simple and good enough for "help the
+  operator see what's active" — not a calibrated measurement.
 - **Peak detection**: bins at or above `noise_floor + SIGNAL_THRESHOLD_DB`
   (default 10 dB) are active; runs of adjacent active bins become one
-  signal. No modulation recognition, no classification, no fingerprinting
-  — the output is "here's a frequency that's active," which is exactly the
-  scope asked for.
+  signal, computed per hop (see "Process & data flow"). No modulation
+  recognition, no classification, no fingerprinting.
 - **Center frequency**: the frequency of the single highest-power bin in
   the group (not a power-weighted centroid) — simpler, and close enough
   given the bin sizes in use (kHz-scale, not Hz-scale precision).
 - **Tracking/expiry**: `SignalTracker` is a plain in-memory dict keyed by a
-  rounded frequency bucket, capped by TTL-based expiry — this is the one
-  place a naive implementation could grow unbounded ("no unbounded
-  in-memory sweep histories" was explicit in scope), so entries older than
-  `SIGNAL_TTL_SECONDS` (default 30s) are dropped every update, and only the
-  current tracked-signal list is kept — raw sweep bin data is never
-  retained past producing that sweep's `DetectedSignal`s.
+  rounded frequency bucket, capped by TTL-based expiry — entries older
+  than `SIGNAL_TTL_SECONDS` (default 30s) of not being re-observed are
+  dropped on the next update. Because detection now runs per hop rather
+  than per full sweep, a tracked signal is only expired if it's missing
+  across roughly one full pass's worth of hops, not one hop — a signal
+  briefly absent from a single hop-cycle (e.g. right at a hop boundary)
+  doesn't flicker out of the list.
+- **Accepted limitation**: a signal straddling a hop boundary can show up
+  as two weaker partial detections for one hop-cycle instead of one clean
+  one. `SignalTracker`'s frequency-proximity matching absorbs this over
+  subsequent hops rather than needing explicit boundary-merging logic,
+  which would add real complexity for a rare edge case.
 
-### Scan <-> listen <-> scan transitions
+### Scan results persist after stop; "Return to Scan" doesn't restart the scan
 
-- Selecting a signal (`POST /api/sdr/scan/listen`) calls, under the
-  manager's lock: stop the scan (`_stop_scan_locked`, remembering
-  `ScanParams` in `_last_scan_params`), then `_start_listening_locked` with
-  the selected frequency and a demod mode (operator-selected or a sensible
-  default). This is the same "tear down whatever's running, then start the
-  new thing" pattern Phase 1 already used for listen→listen restarts.
-- `POST /api/sdr/scan/resume` starts scanning again using
-  `_last_scan_params` if one is remembered (typically right after stopping
-  a listen session that came from a scan); it's a plain, visible action in
-  the UI ("Return to Scan" button), not something that fires automatically
-  the instant listening stops — the operator explicitly asked to keep this
-  "understandable," and an automatic resume could restart RF scanning
-  while the operator is still doing something else with the frequency they
-  just tuned to (e.g. about to save it).
+Field-testing surfaced that clearing the signal table the instant Stop
+Scan was pressed made the natural workflow — scan, then go check out a
+few of the findings one at a time — needlessly expensive: returning from
+listening meant re-scanning from scratch to see the list again. The fix
+changes where the scan's live state lives, not just the UI:
+
+- `SDRManager`/`DemoSDRManager` hold `self._scan_engine: ScanEngine | None`
+  and **do not clear it in `stop_scan()`** — only a *new* `start_scan()`
+  replaces it with a fresh `ScanEngine` (discarding the old results).
+  `/api/status`'s `sdr.scan` is populated whenever `_scan_engine is not
+  None`, regardless of whether a scan is currently running — so the last
+  scan's table stays visible (with its actual last-known noise floor,
+  signals, and sweep time) after Stop Scan, after starting to listen to a
+  signal from it, and even after a hardware disconnect while scanning.
+- `sdr.scan.current_freq_mhz` (the live "Scanning: X MHz" cursor) is the
+  one field that's deliberately *not* preserved after stop — it's only
+  meaningful while a scan is actually live, so `snapshot()` reports it as
+  `None` whenever `state != SCANNING`, even though the engine object
+  itself still remembers the last value internally.
+- `has_scan_results` (an `SDRSnapshot` field, was named `can_resume_scan`)
+  now means "there are results to show," not "a scan can be silently
+  restarted" — reflecting that there is no more auto-restart behavior at
+  all. **The `POST /api/sdr/scan/resume` endpoint and
+  `SDRManagerBase.resume_scan()` were removed entirely.** "Return to Scan"
+  in the UI is now purely a frontend action: stop listening if currently
+  listening, switch to the Scan tab. Nothing is spawned — the table is
+  already sitting in `/api/status`. Hitting "Start Scan" again is how the
+  operator explicitly asks for a fresh sweep; this was a deliberate choice
+  (over auto-resuming) so RF scanning never restarts as a side effect of
+  navigating the UI.
+- The frontend additionally gates the "Return to Scan" button on a
+  client-side flag (`cameFromScanSelection` in `app.js`) so it only
+  appears after clicking a signal from the scan table — not every time the
+  operator is on the Tune tab with old scan results lying around. This is
+  UI-only state (not persisted, not sent to the backend); it resets on a
+  manual tune or a saved-bookmark selection, but not on tab navigation
+  alone (switching to Scan and back to Tune without taking a new listening
+  action keeps it showing, since the active listen session still
+  originated from that scan pick).
 
 ### Demo scanning
 
-`watchtower/scanner/demo_source.py` is the *only* place that fabricates
-sweep data — it generates a Sweep with a wandering synthetic noise floor
-and a handful of seeded, slowly-drifting "signals" at fixed demo
-frequencies. That synthetic Sweep is fed through the exact same
-`estimate_noise_floor`/`find_signals`/`SignalTracker` pipeline production
-scanning uses, so demo mode exercises real detection/tracking logic end to
-end, not a separately-faked signal list — only the RF input is fake.
-`DemoSDRManager.start_scan`/`stop_scan` never spawn `rtl_power`.
+`watchtower/scanner/demo_source.py` is the *only* place that fabricates RF
+data. Demo scanning mirrors real scanning's hop-by-hop arrival rather than
+generating the whole requested range at once: `iter_demo_hops` steps
+through the range in `DEMO_HOP_HZ`-sized chunks (matching a real
+`rtl_power` hop's practical width), `generate_demo_hop` produces synthetic
+bins for one such chunk, and `DemoSDRManager._scan_loop` feeds each one to
+the same `ScanEngine.ingest_hop`/`complete_sweep` real scanning uses —
+signal placement is a function of absolute frequency (not hop-relative
+position), so a synthetic signal sits at the same frequency and looks the
+same regardless of which hop is being generated. The result: demo scanning
+exercises the real incremental-detection and noise-floor code paths end to
+end, not a separately-faked signal list — only the RF input is fake, and
+`DemoSDRManager.start_scan`/`stop_scan` still never spawn `rtl_power`.
+
+### Auto-selecting demodulation mode from a scan signal
+
+Selecting a signal from the scan table (not a saved bookmark — those keep
+their own stored mode) picks a demod mode from the signal's frequency via
+`guessModeForFrequency()` in `app.js`, replacing the previous behavior of
+always reusing whatever mode was last active in the Tune panel (which
+meant a signal found in the FM broadcast band played as static until the
+operator manually switched to WFM). This is a deliberately small,
+frontend-only heuristic — a couple of well-known bands (87.5–108 MHz →
+WFM, 108–137 MHz → AM for civil aviation/VOR), falling back to NFM (Phase
+1's original default) for everything else — not an exhaustive band plan.
 
 ## Saved frequencies (bookmarks)
 
@@ -591,7 +647,8 @@ watchtower/
 │   ├── parser.py       # parse_rtl_power_line, SweepAccumulator
 │   ├── detect.py       # estimate_noise_floor, find_signals
 │   ├── tracker.py      # SignalTracker
-│   └── demo_source.py  # synthetic sweep generator (demo mode only)
+│   ├── engine.py       # ScanEngine: hop stream -> live signals/noise floor/cursor
+│   └── demo_source.py  # synthetic per-hop sweep generator (demo mode only)
 ├── sdr/
 │   └── gain.py          # static R820T/R820T2 gain preset table
 ├── storage/

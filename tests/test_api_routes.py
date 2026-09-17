@@ -154,8 +154,12 @@ async def test_scan_start_stop_lifecycle():
 
         status = await (await client.get("/api/status")).json()
         assert status["sdr"]["state"] == "idle"
-        assert status["sdr"]["scan"] is None
-        assert status["sdr"]["can_resume_scan"] is True
+        # Results from the just-stopped scan stick around until the next
+        # start_scan(), rather than disappearing the moment it's stopped.
+        assert status["sdr"]["scan"] is not None
+        assert status["sdr"]["scan"]["start_mhz"] == 88.0
+        assert status["sdr"]["scan"]["current_freq_mhz"] is None
+        assert status["sdr"]["has_scan_results"] is True
     finally:
         await client.close()
 
@@ -187,33 +191,24 @@ async def test_selecting_a_signal_stops_scan_and_starts_listening():
 
         status = await (await client.get("/api/status")).json()
         assert status["sdr"]["state"] == "listening"
-        assert status["sdr"]["scan"] is None
-        assert status["sdr"]["can_resume_scan"] is True
+        # Last scan's results are still there for when the operator
+        # navigates back to the scan tab — starting to listen doesn't
+        # clear them, it just stops the scan process.
+        assert status["sdr"]["scan"] is not None
+        assert status["sdr"]["has_scan_results"] is True
     finally:
         await client.close()
 
 
-async def test_resume_scan_after_stopping_listening():
-    client = await demo_client()
-    try:
-        await client.post("/api/sdr/scan/start", json={"start_mhz": 88.0, "end_mhz": 108.0})
-        await client.post("/api/sdr/listen/start", json={"frequency_mhz": 95.3, "mode": "wfm"})
-        await client.post("/api/sdr/listen/stop")
-
-        resp = await client.post("/api/sdr/scan/resume")
-        assert resp.status == 200
-
-        status = await (await client.get("/api/status")).json()
-        assert status["sdr"]["state"] == "scanning"
-    finally:
-        await client.close()
-
-
-async def test_resume_scan_without_prior_scan_returns_409():
+async def test_scan_endpoint_no_longer_exists():
+    """Returning to the scan view is now purely a frontend tab switch —
+    results already persist in /api/status (see test above) — so there is
+    no server-side "resume" action to restart scanning.
+    """
     client = await demo_client()
     try:
         resp = await client.post("/api/sdr/scan/resume")
-        assert resp.status == 409
+        assert resp.status == 404
     finally:
         await client.close()
 

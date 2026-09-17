@@ -6,13 +6,20 @@ Pipeline for a listen session:
 
 Pipeline for a scan session:
 
-    rtl_power (CSV sweep rows on stdout) -> SweepAccumulator -> Sweep
-        -> estimate_noise_floor/find_signals -> SignalTracker
+    rtl_power (CSV sweep rows on stdout) -> per-hop -> ScanEngine.ingest_hop
+        (live signal list, updated as each hop arrives)
+    rtl_power rows -> SweepAccumulator -> full Sweep -> ScanEngine.complete_sweep
+        (refreshes the noise floor once a full pass completes)
 
 Only one pipeline (listen or scan) exists at a time — both are owned and
 torn down through the same asyncio.Lock and the same ReceiverState field.
 Starting either one always tears down whatever the manager currently owns
 first. See ARCHITECTURE.md, "Receiver state model" and "Wideband scanner".
+
+Scan results (the ScanEngine) deliberately survive stop_scan() — they are
+only replaced when a *new* scan starts, not cleared on stop, so the
+operator can browse what was found after stopping without losing it. See
+ARCHITECTURE.md, "Wideband scanner" for why.
 """
 
 from __future__ import annotations
@@ -23,11 +30,10 @@ import time
 from dataclasses import replace
 
 from watchtower.logging_setup import get_logger
-from watchtower.scanner import detect as scanner_detect
 from watchtower.scanner import parser as scanner_parser
-from watchtower.scanner.base import ScanParams, validate_scan_range
+from watchtower.scanner.base import ScanParams, Sweep, validate_scan_range
+from watchtower.scanner.engine import ScanEngine
 from watchtower.scanner.parser import SweepAccumulator
-from watchtower.scanner.tracker import SignalTracker
 from watchtower.sdr import detect, process
 from watchtower.sdr.base import (
     HF_ADVISORY_THRESHOLD_MHZ,
@@ -185,16 +191,15 @@ class SDRManager(SDRManagerBase):
         self._audio_client_lock = asyncio.Lock()
         self._audio_client_active = False
 
-        # Scan pipeline
+        # Scan pipeline. _scan_engine deliberately outlives stop_scan() —
+        # see module docstring — and is only replaced by the next
+        # start_scan(). _scan_accumulator is per-session (real scanning
+        # only) since it just groups rtl_power's hop lines into full
+        # sweeps; it's recreated each start_scan().
         self._scan_proc: ManagedProcess | None = None
         self._scan_reader_task: asyncio.Task | None = None
-        self._scan_params: ScanParams | None = None
-        self._last_scan_params: ScanParams | None = None
         self._scan_accumulator: SweepAccumulator | None = None
-        self._scan_tracker: SignalTracker | None = None
-        self._scan_noise_floor_db: float | None = None
-        self._scan_last_sweep_at: float | None = None
-        self._scan_signals: list = []
+        self._scan_engine: ScanEngine | None = None
 
         # Hot-plug monitor
         self._monitor_task: asyncio.Task | None = None
@@ -205,13 +210,15 @@ class SDRManager(SDRManagerBase):
         tools_available = detect.find_rtl_fm() is not None and detect.find_ffmpeg() is not None
         hf_advisory = bool(self._params and self._params.frequency_mhz < HF_ADVISORY_THRESHOLD_MHZ)
         scan_snapshot = None
-        if self._scan_params is not None:
+        if self._scan_engine is not None:
+            engine = self._scan_engine
             scan_snapshot = ScanSnapshot(
-                start_mhz=self._scan_params.start_mhz,
-                end_mhz=self._scan_params.end_mhz,
-                bin_khz=self._scan_params.bin_khz,
-                noise_floor_db=self._scan_noise_floor_db,
-                last_sweep_at=self._scan_last_sweep_at,
+                start_mhz=engine.params.start_mhz,
+                end_mhz=engine.params.end_mhz,
+                bin_khz=engine.params.bin_khz,
+                noise_floor_db=engine.noise_floor_db,
+                last_sweep_at=engine.last_sweep_at,
+                current_freq_mhz=engine.current_freq_mhz if self._state == ReceiverState.SCANNING else None,
                 signals=[
                     TrackedSignalView(
                         frequency_mhz=s.frequency_hz / 1_000_000,
@@ -221,7 +228,7 @@ class SDRManager(SDRManagerBase):
                         first_seen=s.first_seen,
                         last_seen=s.last_seen,
                     )
-                    for s in self._scan_signals
+                    for s in engine.signals
                 ],
             )
         return SDRSnapshot(
@@ -233,7 +240,7 @@ class SDRManager(SDRManagerBase):
             error=self._error,
             hf_advisory=hf_advisory,
             scan=scan_snapshot,
-            can_resume_scan=self._last_scan_params is not None,
+            has_scan_results=self._scan_engine is not None,
         )
 
     async def refresh_devices(self) -> list[SDRDevice]:
@@ -430,14 +437,9 @@ class SDRManager(SDRManagerBase):
             logger.warning("scan failed to start: %s", self._error)
             return False, self._error
 
-        match_tolerance_hz = max(params.bin_khz * 1000 * 2, 5000)
         self._scan_proc = scan_proc
-        self._scan_params = params
         self._scan_accumulator = SweepAccumulator()
-        self._scan_tracker = SignalTracker(match_tolerance_hz=match_tolerance_hz)
-        self._scan_noise_floor_db = None
-        self._scan_last_sweep_at = None
-        self._scan_signals = []
+        self._scan_engine = ScanEngine(params)  # fresh engine: discards whatever the last scan showed
         self._scan_reader_task = asyncio.create_task(self._read_scan_output(scan_proc), name="sdr-scan-reader")
         self._state = ReceiverState.SCANNING
         self._device_seen_once = True
@@ -451,12 +453,6 @@ class SDRManager(SDRManagerBase):
         async with self._lock:
             await self._stop_scan_internal()
 
-    async def resume_scan(self) -> tuple[bool, str | None]:
-        async with self._lock:
-            if self._last_scan_params is None:
-                return False, "No previous scan to resume."
-            return await self._start_scan_locked(self._last_scan_params)
-
     async def _stop_scan_internal(self) -> None:
         if self._scan_reader_task:
             self._scan_reader_task.cancel()
@@ -466,14 +462,8 @@ class SDRManager(SDRManagerBase):
         if self._scan_proc:
             await self._scan_proc.terminate()
             self._scan_proc = None
-        if self._scan_params is not None:
-            self._last_scan_params = self._scan_params
-        self._scan_params = None
         self._scan_accumulator = None
-        self._scan_tracker = None
-        self._scan_noise_floor_db = None
-        self._scan_last_sweep_at = None
-        self._scan_signals = []
+        # self._scan_engine is deliberately left alone — see module docstring.
         if self._state in (ReceiverState.SCANNING, ReceiverState.STARTING):
             self._state = ReceiverState.IDLE
 
@@ -495,24 +485,28 @@ class SDRManager(SDRManagerBase):
         # entry point) — deliberately: these are cosmetic telemetry fields
         # read by snapshot(), not correctness-critical state, and
         # _stop_scan_internal() always cancels+awaits this task before
-        # clearing them, so there's no write-after-clear race.
+        # this can run again, so there's no write-after-stop race.
         text = text.strip()
-        if not text or self._scan_accumulator is None or self._scan_tracker is None:
+        if not text or self._scan_accumulator is None or self._scan_engine is None:
             return
         try:
             row = scanner_parser.parse_rtl_power_line(text)
         except ValueError:
             logger.debug("ignoring unparseable rtl_power line: %r", text[:200])
             return
-        sweep = self._scan_accumulator.ingest(row)
-        if sweep is None:
-            return
-        noise_floor = scanner_detect.estimate_noise_floor(sweep.powers_db)
-        detected = scanner_detect.find_signals(sweep, noise_floor)
+
         now = time.time()
-        self._scan_signals = self._scan_tracker.update(detected, now=now)
-        self._scan_noise_floor_db = noise_floor
-        self._scan_last_sweep_at = now
+        hop = Sweep(
+            timestamp_key=row.timestamp_key,
+            freqs_hz=[float(row.hz_low + i * row.hz_step) for i in range(len(row.dbs))],
+            powers_db=list(row.dbs),
+            bin_hz=float(row.hz_step),
+        )
+        self._scan_engine.ingest_hop(hop, now)
+
+        full_sweep = self._scan_accumulator.ingest(row)
+        if full_sweep is not None:
+            self._scan_engine.complete_sweep(full_sweep, now)
 
     # --------------------------------------------------------- hot-plug monitor
 
